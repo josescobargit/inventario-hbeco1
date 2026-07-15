@@ -1,4 +1,10 @@
 const API_PREFIX = "/api/v1";
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/$/, "");
+
+export function apiUrl(path: string): string {
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  return `${API_BASE_URL}${API_PREFIX}${normalizedPath}`;
+}
 
 export class ApiError extends Error {
   constructor(
@@ -14,7 +20,7 @@ export async function apiRequest<T>(
   path: string,
   init: RequestInit = {},
 ): Promise<T> {
-  const response = await fetch(`${API_PREFIX}${path}`, {
+  const response = await fetch(apiUrl(path), {
     ...init,
     credentials: "include",
     headers: {
@@ -38,4 +44,3 @@ export async function apiRequest<T>(
   if (response.status === 204) return undefined as T;
   return (await response.json()) as T;
 }
-

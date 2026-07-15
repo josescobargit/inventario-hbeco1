@@ -27,6 +27,7 @@ class Settings(BaseSettings):
         "http://127.0.0.1:5173",
         "http://localhost:5173",
     ]
+    cors_origin_regex: str | None = None
 
     @field_validator("api_prefix")
     @classmethod
@@ -41,6 +42,21 @@ class Settings(BaseSettings):
         environment = info.data.get("environment")
         if environment == "production" and not value:
             raise ValueError("COOKIE_SECURE debe ser true en producción")
+        return value
+
+    @field_validator("cookie_samesite")
+    @classmethod
+    def require_secure_cross_site_cookie(cls, value: str, info):
+        cookie_secure = info.data.get("cookie_secure")
+        if value == "none" and not cookie_secure:
+            raise ValueError("COOKIE_SECURE debe ser true cuando COOKIE_SAMESITE=none")
+        return value
+
+    @field_validator("cors_origin_regex", mode="before")
+    @classmethod
+    def empty_cors_regex_is_disabled(cls, value: str | None) -> str | None:
+        if isinstance(value, str) and not value.strip():
+            return None
         return value
 
 

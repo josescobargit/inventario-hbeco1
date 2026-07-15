@@ -44,6 +44,16 @@ make frontend
 - API: `http://127.0.0.1:8000`
 - Documentación API: `http://127.0.0.1:8000/docs`
 
+## Despliegue
+
+La ruta recomendada para iniciar es **Supabase + Render + Vercel**:
+
+- Supabase para PostgreSQL.
+- Render para el backend FastAPI.
+- Vercel para el frontend React/Vite.
+
+La guía paso a paso está en [`docs/deployment/supabase-render-vercel.md`](docs/deployment/supabase-render-vercel.md).
+
 ## Validaciones obligatorias
 
 Antes de cerrar un cambio de base de datos:
