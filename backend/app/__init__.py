@@ -1,0 +1,1 @@
+"""InventarioApp backend."""

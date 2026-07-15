@@ -1,0 +1,1 @@
+"""Physical stock adjustment workflow."""
