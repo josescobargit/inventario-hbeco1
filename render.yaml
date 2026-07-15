@@ -9,6 +9,8 @@ services:
     envVars:
       - key: ENVIRONMENT
         value: production
+      - key: PYTHON_VERSION
+        value: 3.12.13
       - key: API_PREFIX
         value: /api/v1
       - key: COOKIE_SECURE

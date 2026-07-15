@@ -31,6 +31,7 @@ Variables necesarias:
 
 ```text
 ENVIRONMENT=production
+PYTHON_VERSION=3.12.13
 API_PREFIX=/api/v1
 DATABASE_URL=postgresql+psycopg://...
 MIGRATION_DATABASE_URL=postgresql+psycopg://...
