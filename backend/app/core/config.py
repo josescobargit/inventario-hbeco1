@@ -36,6 +36,17 @@ class Settings(BaseSettings):
             raise ValueError("API_PREFIX debe comenzar con /")
         return value.rstrip("/")
 
+    @field_validator("database_url", "migration_database_url")
+    @classmethod
+    def normalize_supabase_pooler_port(cls, value: str | None) -> str | None:
+        if value and "pooler.supabase.com:5432/" in value:
+            return value.replace(
+                "pooler.supabase.com:5432/",
+                "pooler.supabase.com:6543/",
+                1,
+            )
+        return value
+
     @field_validator("cookie_secure")
     @classmethod
     def require_secure_production_cookie(cls, value: bool, info):
