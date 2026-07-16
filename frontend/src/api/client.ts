@@ -1,5 +1,5 @@
 const API_PREFIX = "/api/v1";
-const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/$/, "");
+const CONFIGURED_API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/$/, "");
 
 let unauthorizedHandler: (() => void) | null = null;
 
@@ -7,9 +7,18 @@ export function setUnauthorizedHandler(handler: (() => void) | null): void {
   unauthorizedHandler = handler;
 }
 
+function shouldUseSameOriginApi(): boolean {
+  if (typeof window === "undefined") return false;
+  return !["localhost", "127.0.0.1"].includes(window.location.hostname);
+}
+
+function apiBaseUrl(): string {
+  return shouldUseSameOriginApi() ? "" : CONFIGURED_API_BASE_URL;
+}
+
 export function apiUrl(path: string): string {
   const normalizedPath = path.startsWith("/") ? path : `/${path}`;
-  return `${API_BASE_URL}${API_PREFIX}${normalizedPath}`;
+  return `${apiBaseUrl()}${API_PREFIX}${normalizedPath}`;
 }
 
 export class ApiError extends Error {
