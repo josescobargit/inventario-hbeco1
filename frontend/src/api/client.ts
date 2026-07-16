@@ -1,6 +1,12 @@
 const API_PREFIX = "/api/v1";
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/$/, "");
 
+let unauthorizedHandler: (() => void) | null = null;
+
+export function setUnauthorizedHandler(handler: (() => void) | null): void {
+  unauthorizedHandler = handler;
+}
+
 export function apiUrl(path: string): string {
   const normalizedPath = path.startsWith("/") ? path : `/${path}`;
   return `${API_BASE_URL}${API_PREFIX}${normalizedPath}`;
@@ -38,6 +44,7 @@ export async function apiRequest<T>(
     } catch {
       // The fallback is intentionally written for non-technical users.
     }
+    if (response.status === 401) unauthorizedHandler?.();
     throw new ApiError(message, response.status);
   }
 

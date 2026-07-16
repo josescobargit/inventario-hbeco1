@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 
-import { ApiError, apiRequest } from "./api/client";
+import { ApiError, apiRequest, setUnauthorizedHandler } from "./api/client";
 import { AuthScreen } from "./features/auth/AuthScreen";
 import type { AuthenticatedUser } from "./features/auth/types";
 import { Dashboard } from "./features/dashboard/Dashboard";
@@ -13,6 +13,17 @@ type AppState =
 
 export function App() {
   const [state, setState] = useState<AppState>({ status: "loading" });
+
+  useEffect(() => {
+    setUnauthorizedHandler(() => {
+      setState((current) =>
+        current.status === "authenticated"
+          ? { status: "anonymous", bootstrapRequired: false }
+          : current,
+      );
+    });
+    return () => setUnauthorizedHandler(null);
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -98,4 +109,3 @@ export function App() {
     />
   );
 }
-

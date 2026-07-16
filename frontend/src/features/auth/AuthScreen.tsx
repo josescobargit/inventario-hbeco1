@@ -1,6 +1,6 @@
 import { type FormEvent, useState } from "react";
 
-import { apiRequest } from "../../api/client";
+import { ApiError, apiRequest } from "../../api/client";
 import type { AuthenticatedUser } from "./types";
 
 interface AuthScreenProps {
@@ -59,16 +59,23 @@ export function AuthScreen({
     setError(null);
     const form = new FormData(event.currentTarget);
     try {
-      const user = await apiRequest<AuthenticatedUser>("/auth/login", {
+      await apiRequest<AuthenticatedUser>("/auth/login", {
         method: "POST",
         body: JSON.stringify({
           username: form.get("username"),
           password: form.get("password"),
         }),
       });
-      onAuthenticated(user);
+      const confirmedUser = await apiRequest<AuthenticatedUser>("/auth/me");
+      onAuthenticated(confirmedUser);
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "No pudimos ingresar.");
+      if (caught instanceof ApiError && caught.status === 401) {
+        setError(
+          "No pudimos confirmar la sesión. Intenta nuevamente en unos segundos.",
+        );
+      } else {
+        setError(caught instanceof Error ? caught.message : "No pudimos ingresar.");
+      }
     } finally {
       setSubmitting(false);
     }
