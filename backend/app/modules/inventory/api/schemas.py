@@ -1,9 +1,14 @@
+import uuid
+
 from pydantic import BaseModel
 
 
 class AvailabilityResponse(BaseModel):
+    id: uuid.UUID
     sku: str
     product_name: str
+    barcode: str | None
+    contifico_aux_code: str | None
     category: str
     physical_confirmed: int
     reserved: int

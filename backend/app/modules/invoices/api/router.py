@@ -5,7 +5,7 @@ from decimal import Decimal
 from typing import Annotated, Literal
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, field_validator, model_validator
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.modules.audit.infrastructure.models import AuditLog
@@ -74,6 +74,42 @@ class InvoiceInput(BaseModel):
         return self
 
 
+class QuickInvoiceInput(BaseModel):
+    invoice_number: str
+    invoice_date: date
+    purchase_order_id: uuid.UUID
+    is_void: bool = False
+    authorization_number: str | None = None
+    remittance_guide: str | None = None
+    total_value: Decimal | None = Field(default=None, ge=0)
+    notes: str | None = None
+    lines: list[LineInput] = []
+
+    @field_validator("invoice_number")
+    @classmethod
+    def invoice_format(cls, value):
+        return InvoiceInput.invoice_format(value)
+
+    @model_validator(mode="after")
+    def valid_detail(self):
+        if self.is_void and self.lines:
+            raise ValueError("Una factura anulada no puede contener productos.")
+        if not self.is_void and not self.lines:
+            raise ValueError("Una factura activa debe contener al menos un producto.")
+        return self
+
+
+class BulkInvoiceInput(BaseModel):
+    invoices: list[QuickInvoiceInput] = Field(min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def unique_numbers(self):
+        numbers = [item.invoice_number for item in self.invoices]
+        if len(numbers) != len(set(numbers)):
+            raise ValueError("La carga contiene números de factura repetidos.")
+        return self
+
+
 router = APIRouter(prefix="/invoices", tags=["Facturas emitidas"])
 
 
@@ -84,9 +120,12 @@ def list_invoices(_user: CurrentUser, db: Annotated[Session, Depends(get_db)]):
     )
 
 
-@router.post("", status_code=201)
-def register_invoice(
-    payload: InvoiceInput, user: CurrentUser, db: Annotated[Session, Depends(get_db)]
+def _register_invoice(
+    payload: InvoiceInput,
+    user,
+    db: Session,
+    *,
+    commit: bool,
 ):
     if payload.source_type != "purchase_order" and not exception_invoices_allowed(db):
         raise HTTPException(
@@ -296,10 +335,312 @@ def register_invoice(
             new_value={"number": invoice.invoice_number, "products": len(requested)},
         )
     )
-    db.commit()
+    if commit:
+        db.commit()
+    else:
+        db.flush()
     return {
         "id": invoice.id,
         "invoice_number": invoice.invoice_number,
         "incident_status": invoice.incident_status,
         "dispatch_status": invoice.dispatch_status,
     }
+
+
+@router.post("", status_code=201)
+def register_invoice(
+    payload: InvoiceInput, user: CurrentUser, db: Annotated[Session, Depends(get_db)]
+):
+    return _register_invoice(payload, user, db, commit=True)
+
+
+@router.post("/bulk", status_code=201)
+def register_bulk_invoices(
+    payload: BulkInvoiceInput,
+    user: CurrentUser,
+    db: Annotated[Session, Depends(get_db)],
+):
+    existing = set(
+        db.scalars(
+            select(Invoice.invoice_number).where(
+                Invoice.invoice_number.in_(
+                    [item.invoice_number for item in payload.invoices]
+                )
+            )
+        ).all()
+    )
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Facturas ya registradas: {', '.join(sorted(existing))}.",
+        )
+    results = []
+    try:
+        for item in payload.invoices:
+            po = db.get(PurchaseOrder, item.purchase_order_id)
+            if po is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"{item.invoice_number}: selecciona una OC válida.",
+                )
+            customer = po.customer_name or po.chain_name
+            if item.is_void:
+                invoice = Invoice(
+                    invoice_number=item.invoice_number,
+                    invoice_date=item.invoice_date,
+                    purchase_order_id=po.id,
+                    source_type="purchase_order",
+                    customer_name=customer,
+                    chain_name=po.chain_name,
+                    authorization_number=item.authorization_number,
+                    remittance_guide=item.remittance_guide,
+                    total_value=item.total_value,
+                    notes=item.notes,
+                    administrative_status="cancelled",
+                    dispatch_status="not_applicable",
+                    delivery_status="not_applicable",
+                    created_by_user_id=user.id,
+                )
+                db.add(invoice)
+                db.flush()
+                db.add(
+                    AuditLog(
+                        actor_user_id=user.id,
+                        action="void_invoice_registered",
+                        entity_type="invoice",
+                        entity_id=str(invoice.id),
+                        new_value={"number": invoice.invoice_number},
+                    )
+                )
+                results.append(
+                    {
+                        "id": invoice.id,
+                        "invoice_number": invoice.invoice_number,
+                        "administrative_status": "cancelled",
+                    }
+                )
+                continue
+            result = _register_invoice(
+                InvoiceInput(
+                    invoice_number=item.invoice_number,
+                    invoice_date=item.invoice_date,
+                    purchase_order_id=po.id,
+                    source_type="purchase_order",
+                    customer_name=customer,
+                    chain_name=po.chain_name,
+                    authorization_number=item.authorization_number,
+                    remittance_guide=item.remittance_guide,
+                    total_value=item.total_value,
+                    notes=item.notes,
+                    lines=item.lines,
+                ),
+                user,
+                db,
+                commit=False,
+            )
+            results.append(result)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return {"invoices": results}
+
+
+@router.put("/{invoice_id}")
+def update_invoice(
+    invoice_id: uuid.UUID,
+    payload: InvoiceInput,
+    user: CurrentUser,
+    db: Annotated[Session, Depends(get_db)],
+):
+    invoice = db.scalar(
+        select(Invoice).where(Invoice.id == invoice_id).with_for_update()
+    )
+    if invoice is None:
+        raise HTTPException(status_code=404, detail="No encontramos la factura.")
+    if invoice.dispatch_status != "pending":
+        raise HTTPException(
+            status_code=409,
+            detail="No se puede editar el detalle porque el despacho ya inició.",
+        )
+    duplicate = db.scalar(
+        select(Invoice.id).where(
+            Invoice.invoice_number == payload.invoice_number,
+            Invoice.id != invoice.id,
+        )
+    )
+    if duplicate:
+        raise HTTPException(status_code=409, detail="Esta factura ya está registrada.")
+    po = (
+        db.get(PurchaseOrder, payload.purchase_order_id)
+        if payload.purchase_order_id
+        else None
+    )
+    if payload.source_type == "purchase_order" and po is None:
+        raise HTTPException(status_code=422, detail="Selecciona una OC válida.")
+    old_rows = db.execute(
+        select(InvoiceLine, Product)
+        .join(Product, Product.id == InvoiceLine.product_id)
+        .where(InvoiceLine.invoice_id == invoice.id)
+    ).all()
+    old_by_sku = {product.sku: line for line, product in old_rows}
+    requested = {line.sku.strip().upper(): line for line in payload.lines}
+    if len(requested) != len(payload.lines):
+        raise HTTPException(status_code=422, detail="No repitas un SKU en la factura.")
+    all_skus = set(old_by_sku) | set(requested)
+    rows = db.execute(
+        select(Product, InventoryPositionModel, Warehouse)
+        .join(InventoryPositionModel, InventoryPositionModel.product_id == Product.id)
+        .join(Warehouse, Warehouse.id == InventoryPositionModel.warehouse_id)
+        .where(Product.sku.in_(all_skus), Warehouse.code == "principal")
+        .with_for_update(of=InventoryPositionModel)
+    ).all()
+    found = {
+        product.sku: (product, position, warehouse)
+        for product, position, warehouse in rows
+    }
+    if set(requested) - set(found):
+        raise HTTPException(
+            status_code=422,
+            detail=f"SKU desconocidos: {', '.join(sorted(set(requested) - set(found)))}",
+        )
+    before_snapshot = {
+        "number": invoice.invoice_number,
+        "purchase_order_id": str(invoice.purchase_order_id)
+        if invoice.purchase_order_id
+        else None,
+        "lines": {sku: line.quantity for sku, line in old_by_sku.items()},
+    }
+    for sku in all_skus:
+        product, position, warehouse = found[sku]
+        previous = old_by_sku[sku].quantity if sku in old_by_sku else 0
+        new = requested[sku].quantity if sku in requested else 0
+        delta = new - previous
+        if delta > 0:
+            available = InventoryPosition(
+                position.physical_confirmed,
+                position.reserved,
+                position.invoiced_not_dispatched,
+                position.blocked_by_incident,
+            ).available_to_invoice
+            if delta > available:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"{sku}: el cambio requiere {delta} unidades y solo hay {available}.",
+                )
+        if delta:
+            before = {
+                "invoiced_not_dispatched": position.invoiced_not_dispatched,
+                "version": position.version,
+            }
+            position.invoiced_not_dispatched += delta
+            position.version += 1
+            db.add(
+                InventoryMovement(
+                    warehouse_id=warehouse.id,
+                    product_id=product.id,
+                    actor_user_id=user.id,
+                    movement_type="invoice_edited",
+                    reference_type="invoice",
+                    reference_id=str(invoice.id),
+                    reason="Detalle de factura externa corregido",
+                    before_value=before,
+                    after_value={
+                        "invoiced_not_dispatched": position.invoiced_not_dispatched,
+                        "version": position.version,
+                    },
+                )
+            )
+    db.execute(delete(InvoiceAlert).where(InvoiceAlert.invoice_id == invoice.id))
+    db.execute(delete(InvoiceLine).where(InvoiceLine.invoice_id == invoice.id))
+    po_quantities = (
+        {
+            product.sku: line.ordered_quantity
+            for line, product in db.execute(
+                select(PurchaseOrderLine, Product)
+                .join(Product, Product.id == PurchaseOrderLine.product_id)
+                .where(PurchaseOrderLine.purchase_order_id == po.id)
+            )
+        }
+        if po
+        else {}
+    )
+    invoice.incident_status = "none"
+    for sku, line_input in requested.items():
+        product = found[sku][0]
+        outside = bool(po and sku not in po_quantities)
+        db.add(
+            InvoiceLine(
+                invoice_id=invoice.id,
+                product_id=product.id,
+                quantity=line_input.quantity,
+                unit_price=line_input.unit_price,
+                outside_purchase_order=outside,
+            )
+        )
+        other_invoiced = (
+            db.scalar(
+                select(func.coalesce(func.sum(InvoiceLine.quantity), 0))
+                .join(Invoice, Invoice.id == InvoiceLine.invoice_id)
+                .where(
+                    Invoice.purchase_order_id == po.id,
+                    Invoice.id != invoice.id,
+                    Invoice.administrative_status == "confirmed",
+                    InvoiceLine.product_id == product.id,
+                )
+            )
+            if po
+            else 0
+        )
+        if outside or (
+            po and other_invoiced + line_input.quantity > po_quantities.get(sku, 0)
+        ):
+            alert_type = (
+                "product_outside_purchase_order"
+                if outside
+                else "quantity_exceeds_purchase_order"
+            )
+            description = (
+                f"{sku} no consta en la OC original."
+                if outside
+                else f"{sku}: la cantidad acumulada supera las {po_quantities[sku]} unidades de la OC."
+            )
+            db.add(
+                InvoiceAlert(
+                    invoice_id=invoice.id,
+                    product_id=product.id,
+                    alert_type=alert_type,
+                    description=description,
+                )
+            )
+            invoice.incident_status = "open"
+    invoice.invoice_number = payload.invoice_number
+    invoice.invoice_date = payload.invoice_date
+    invoice.purchase_order_id = payload.purchase_order_id
+    invoice.source_type = payload.source_type
+    invoice.customer_name = (
+        (po.customer_name or po.chain_name) if po else payload.customer_name
+    )
+    invoice.chain_name = po.chain_name if po else payload.chain_name
+    invoice.authorization_number = payload.authorization_number
+    invoice.remittance_guide = payload.remittance_guide
+    invoice.total_value = payload.total_value
+    invoice.notes = payload.notes
+    db.add(
+        AuditLog(
+            actor_user_id=user.id,
+            action="invoice_edited",
+            entity_type="invoice",
+            entity_id=str(invoice.id),
+            previous_value=before_snapshot,
+            new_value={
+                "number": invoice.invoice_number,
+                "purchase_order_id": str(invoice.purchase_order_id)
+                if invoice.purchase_order_id
+                else None,
+                "lines": {sku: line.quantity for sku, line in requested.items()},
+            },
+        )
+    )
+    db.commit()
+    return {"id": invoice.id, "invoice_number": invoice.invoice_number}

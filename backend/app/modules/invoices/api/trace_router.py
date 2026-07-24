@@ -150,6 +150,11 @@ def traceability(
             "number": invoice.invoice_number,
             "date": invoice.invoice_date,
             "customer": invoice.customer_name,
+            "chain": invoice.chain_name,
+            "source_type": invoice.source_type,
+            "authorization_number": invoice.authorization_number,
+            "remittance_guide": invoice.remittance_guide,
+            "notes": invoice.notes,
             "total_value": invoice.total_value,
             "net_value": (invoice.total_value or 0) - credits + debits,
             "statuses": {

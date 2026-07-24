@@ -28,6 +28,7 @@ MOVEMENT_LABELS = {
     "reservation_created": "Reserva creada",
     "reservation_released": "Reserva liberada",
     "invoice_registered": "Factura registrada",
+    "invoice_edited": "Factura corregida",
     "dispatch_confirmed": "Despacho confirmado",
     "incident_resolved": "Incidencia resuelta",
     "customer_return": "Devolución",
@@ -125,8 +126,11 @@ def list_availability(
         )
         result.append(
             AvailabilityResponse(
+                id=product.id,
                 sku=product.sku,
                 product_name=product.name,
+                barcode=product.barcode,
+                contifico_aux_code=product.contifico_aux_code,
                 category=product.category,
                 physical_confirmed=position.physical_confirmed,
                 reserved=position.reserved,

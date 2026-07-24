@@ -1,6 +1,10 @@
 import pytest
 from pydantic import ValidationError
-from app.modules.invoices.api.router import InvoiceInput
+from app.modules.invoices.api.router import (
+    BulkInvoiceInput,
+    InvoiceInput,
+    QuickInvoiceInput,
+)
 
 
 def test_invoice_number_requires_ecuadorian_sequence_format() -> None:
@@ -35,3 +39,48 @@ def test_invoice_accepts_quantity_difference_for_incident_tracking() -> None:
         lines=[{"sku": "AE001", "quantity": 999}],
     )
     assert payload.lines[0].quantity == 999
+
+
+def test_void_invoice_keeps_number_without_products() -> None:
+    payload = QuickInvoiceInput(
+        invoice_number="001-001-000000688",
+        invoice_date="2026-07-06",
+        purchase_order_id="00000000-0000-0000-0000-000000000001",
+        is_void=True,
+        lines=[],
+    )
+    assert payload.is_void
+    assert payload.lines == []
+
+
+def test_active_invoice_requires_products_and_void_rejects_them() -> None:
+    common = {
+        "invoice_number": "001-001-000000689",
+        "invoice_date": "2026-07-06",
+        "purchase_order_id": "00000000-0000-0000-0000-000000000001",
+    }
+    with pytest.raises(ValidationError):
+        QuickInvoiceInput(**common, lines=[])
+    with pytest.raises(ValidationError):
+        QuickInvoiceInput(
+            **common, is_void=True, lines=[{"sku": "AE001", "quantity": 1}]
+        )
+
+
+def test_bulk_rejects_duplicate_numbers_but_allows_multiple_invoices_for_one_po() -> (
+    None
+):
+    po_id = "00000000-0000-0000-0000-000000000001"
+    first = {
+        "invoice_number": "001-001-000000690",
+        "invoice_date": "2026-07-06",
+        "purchase_order_id": po_id,
+        "lines": [{"sku": "AE001", "quantity": 1}],
+    }
+    second = {**first, "invoice_number": "001-001-000000691"}
+    payload = BulkInvoiceInput(invoices=[first, second])
+    assert (
+        payload.invoices[0].purchase_order_id == payload.invoices[1].purchase_order_id
+    )
+    with pytest.raises(ValidationError):
+        BulkInvoiceInput(invoices=[first, first])

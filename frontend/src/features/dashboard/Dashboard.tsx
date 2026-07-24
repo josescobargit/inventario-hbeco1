@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import type { AuthenticatedUser } from "../auth/types";
 import { CatalogCenter } from "../catalog/CatalogCenter";
@@ -26,6 +26,14 @@ interface DashboardProps { user: AuthenticatedUser; onLogout: () => Promise<void
 
 export function Dashboard({ user, onLogout }: DashboardProps) {
   const [activeModule, setActiveModule] = useState<ModuleId>("dashboard");
+  useEffect(() => {
+    const navigate = (event: Event) => {
+      const module = (event as CustomEvent<ModuleId>).detail;
+      if (module && moduleById[module]) setActiveModule(module);
+    };
+    window.addEventListener("inventario:navigate", navigate);
+    return () => window.removeEventListener("inventario:navigate", navigate);
+  }, []);
   const component = moduleById[activeModule].component;
 
   const content = component === "overview" ? <OperationalOverview onNavigate={setActiveModule} />

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 
 import { apiRequest } from "../../api/client";
 import { ProductIdentity } from "../inventory/ProductIdentity";
-import { InvoiceRegistrationForm } from "./InvoiceRegistrationForm";
+import { InvoiceRegistrationForm, InvoiceTemplate } from "./InvoiceRegistrationForm";
 
 interface InvoiceSummary {
   id: string;
@@ -19,14 +19,20 @@ interface InvoiceSummary {
 
 interface Traceability {
   invoice: {
+    id: string;
     number: string;
     date: string;
     customer: string;
+    chain: string | null;
+    source_type: string;
+    authorization_number: string | null;
+    remittance_guide: string | null;
+    notes: string | null;
     total_value: string | null;
     net_value: string | number;
     statuses: Record<string, string>;
   };
-  purchase_order: { number: string; chain: string } | null;
+  purchase_order: { id: string; number: string; chain: string } | null;
   lines: Array<{
     sku: string;
     product_name: string;
@@ -65,10 +71,18 @@ export function InvoiceCenter() {
   const [detailLoading, setDetailLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [showForm, setShowForm] = useState(false);
+  const [template, setTemplate] = useState<InvoiceTemplate | null>(null);
+  const [editing, setEditing] = useState(false);
 
   useEffect(() => {
     apiRequest<InvoiceSummary[]>("/invoices")
-      .then((data) => { setInvoices(data); setSelectedId(data[0]?.id ?? null); if (data.length === 0) setDetailLoading(false); })
+      .then((data) => {
+        const requestedId = sessionStorage.getItem("inventario.openInvoiceId");
+        sessionStorage.removeItem("inventario.openInvoiceId");
+        setInvoices(data);
+        setSelectedId(data.some((item) => item.id === requestedId) ? requestedId : data[0]?.id ?? null);
+        if (data.length === 0) setDetailLoading(false);
+      })
       .catch((caught) => setError(caught instanceof Error ? caught.message : "No pudimos cargar las facturas."))
       .finally(() => setLoading(false));
   }, []);
@@ -98,18 +112,40 @@ export function InvoiceCenter() {
     const refreshed = await apiRequest<InvoiceSummary[]>("/invoices");
     setInvoices(refreshed);
     setShowForm(false);
+    setTemplate(null);
+    setEditing(false);
     selectInvoice(id);
+  };
+
+  const populateFromTrace = (edit: boolean) => {
+    if (!trace) return;
+    setTemplate({
+      id: trace.invoice.id,
+      number: trace.invoice.number,
+      date: trace.invoice.date,
+      customer: trace.invoice.customer,
+      chain: trace.invoice.chain,
+      source_type: trace.invoice.source_type,
+      authorization_number: trace.invoice.authorization_number,
+      remittance_guide: trace.invoice.remittance_guide,
+      total_value: trace.invoice.total_value,
+      notes: trace.invoice.notes,
+      purchase_order_id: trace.purchase_order?.id ?? null,
+      lines: trace.lines.map((line) => ({ sku: line.sku, invoiced: line.invoiced })),
+    });
+    setEditing(edit);
+    setShowForm(true);
   };
 
   return (
     <main className="dashboard invoice-center">
       <section className="module-heading">
         <div className="welcome-block"><p className="eyebrow">Trazabilidad documental y operativa</p><h1>Centro de Facturas</h1><p>Aquí no se factura: se verifica qué ocurrió desde la OC hasta la entrega, incluyendo diferencias, incidencias y devoluciones.</p></div>
-        <button className="primary-button" type="button" onClick={() => { setShowForm((value) => !value); setError(null); }}>{showForm ? "Volver al centro" : "Registrar factura"}</button>
+        <button className="primary-button" type="button" onClick={() => { setShowForm((value) => !value); setTemplate(null); setEditing(false); setError(null); }}>{showForm ? "Volver al centro" : "Registrar factura"}</button>
       </section>
 
       {error && <div className="message error" role="alert">{error}</div>}
-      {showForm ? <InvoiceRegistrationForm onCreated={invoiceCreated} onCancel={() => setShowForm(false)} /> : <section className="invoice-workspace">
+      {showForm ? <InvoiceRegistrationForm onCreated={invoiceCreated} onCancel={() => { setShowForm(false); setTemplate(null); setEditing(false); }} template={template} editing={editing} /> : <section className="invoice-workspace">
         <aside className="invoice-list" aria-label="Facturas registradas">
           <label className="search-field invoice-search"><span>Buscar factura</span><input type="search" placeholder="Número, cliente o cadena" value={search} onChange={(event) => setSearch(event.target.value)} /></label>
           {loading && <div className="table-message">Cargando facturas…</div>}
@@ -129,7 +165,7 @@ export function InvoiceCenter() {
           {!detailLoading && trace && <>
             <header className="detail-header">
               <div><p className="eyebrow">Factura externa registrada</p><h2>{trace.invoice.number}</h2><p>{trace.invoice.customer} · {formatDate(trace.invoice.date)}</p></div>
-              <div className="value-summary"><span>Valor original <strong>{formatMoney(trace.invoice.total_value)}</strong></span><span>Valor neto <strong>{formatMoney(trace.invoice.net_value)}</strong></span></div>
+              <div className="value-summary"><span>Valor original <strong>{formatMoney(trace.invoice.total_value)}</strong></span><span>Valor neto <strong>{formatMoney(trace.invoice.net_value)}</strong></span><div className="detail-actions"><button className="secondary-button" type="button" onClick={() => populateFromTrace(false)}>Duplicar</button>{trace.invoice.statuses.dispatch === "pending" && trace.invoice.statuses.administrative === "confirmed" && <button className="secondary-button" type="button" onClick={() => populateFromTrace(true)}>Editar</button>}</div></div>
             </header>
             <div className="status-grid">
               {Object.entries(trace.invoice.statuses).map(([name, status]) => <div key={name}><span>{label(name)}</span><strong>{label(status)}</strong></div>)}

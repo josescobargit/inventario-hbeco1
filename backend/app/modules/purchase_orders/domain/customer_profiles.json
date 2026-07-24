@@ -1,0 +1,13 @@
+{
+  "profiles": [
+    {
+      "chain_names": ["TIA", "TÍA"],
+      "product_aliases": [
+        {"code": "163818000", "sku": "AR004"},
+        {"code": "166451000", "sku": "ACP001"},
+        {"code": "168929000", "sku": "AR003"},
+        {"code": "168933000", "sku": "AR001"}
+      ]
+    }
+  ]
+}

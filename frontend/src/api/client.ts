@@ -60,3 +60,24 @@ export async function apiRequest<T>(
   if (response.status === 204) return undefined as T;
   return (await response.json()) as T;
 }
+
+export async function apiUpload<T>(path: string, body: FormData): Promise<T> {
+  const response = await fetch(apiUrl(path), {
+    method: "POST",
+    body,
+    credentials: "include",
+    headers: { "X-Requested-With": "InventarioApp" },
+  });
+  if (!response.ok) {
+    let message = "No pudimos procesar el documento.";
+    try {
+      const payload = (await response.json()) as { detail?: string };
+      if (payload.detail) message = payload.detail;
+    } catch {
+      // Preserve the reader-friendly fallback for non-JSON failures.
+    }
+    if (response.status === 401) unauthorizedHandler?.();
+    throw new ApiError(message, response.status);
+  }
+  return (await response.json()) as T;
+}
