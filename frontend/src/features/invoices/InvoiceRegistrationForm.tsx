@@ -1,6 +1,6 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { ChangeEvent, DragEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 
-import { apiRequest } from "../../api/client";
+import { apiRequest, apiUpload } from "../../api/client";
 import {
   applyConfirmedAlias, parseInvoiceBlocks, parseProductLines,
   QuickBlock, QuickLine, retryProductRecognition,
@@ -20,7 +20,9 @@ interface InvoiceSummary { invoice_number: string }
 interface DraftLine { sku: string; quantity: number; unit_price: string }
 interface BulkDraft extends QuickBlock {
   order_id: string; invoice_date: string; authorization: string; guide: string;
-  total: string; notes: string;
+  total: string; notes: string; filename?: string;
+  save_status?: "pending" | "processing" | "saved" | "duplicate" | "error";
+  save_detail?: string;
 }
 export interface InvoiceTemplate {
   id: string; number: string; date: string; customer: string; chain: string | null;
@@ -36,6 +38,8 @@ const sourceLabels: Record<string, string> = {
 };
 const today = () => new Date().toLocaleDateString("en-CA");
 const invoicePattern = /^\d{3}-\d{3}-\d{9}$/;
+const BULK_STORAGE_KEY = "inventario.invoiceBulkDraft.v2";
+const BULK_ID_STORAGE_KEY = "inventario.invoiceBulkId.v2";
 
 export function InvoiceRegistrationForm({ onCreated, onCancel, template, editing = false }: { onCreated: (id: string) => Promise<void>; onCancel: () => void; template?: InvoiceTemplate | null; editing?: boolean }) {
   const [mode, setMode] = useState<"individual" | "bulk">("individual");
@@ -60,9 +64,20 @@ export function InvoiceRegistrationForm({ onCreated, onCancel, template, editing
   const [bulkText, setBulkText] = useState("");
   const [blocks, setBlocks] = useState<BulkDraft[]>([]);
   const [bulkConfirmed, setBulkConfirmed] = useState(false);
+  const [files, setFiles] = useState<File[]>([]);
+  const [dragging, setDragging] = useState(false);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [bulkMessage, setBulkMessage] = useState<string | null>(null);
+  const [bulkId] = useState(() => {
+    const stored = globalThis.localStorage?.getItem(BULK_ID_STORAGE_KEY);
+    const value = stored ?? crypto.randomUUID();
+    globalThis.localStorage?.setItem(BULK_ID_STORAGE_KEY, value);
+    return value;
+  });
+  const submitLock = useRef(false);
+  const idempotencyKey = useRef<string | null>(null);
 
   useEffect(() => {
     Promise.all([
@@ -71,9 +86,21 @@ export function InvoiceRegistrationForm({ onCreated, onCancel, template, editing
     ]).then(([loadedOrders, loadedReservations, loadedProducts, invoices]) => {
       setOrders(loadedOrders); setReservations(loadedReservations); setProducts(loadedProducts);
       setRegisteredNumbers(new Set(invoices.map((item) => item.invoice_number)));
+      try {
+        const saved = globalThis.localStorage?.getItem(BULK_STORAGE_KEY);
+        if (saved) setBlocks(JSON.parse(saved) as BulkDraft[]);
+      } catch {
+        globalThis.localStorage?.removeItem(BULK_STORAGE_KEY);
+      }
     }).catch((caught) => setError(caught instanceof Error ? caught.message : "No pudimos preparar el formulario."))
       .finally(() => setLoading(false));
   }, []);
+
+  useEffect(() => {
+    if (loading) return;
+    if (blocks.length) globalThis.localStorage?.setItem(BULK_STORAGE_KEY, JSON.stringify(blocks));
+    else globalThis.localStorage?.removeItem(BULK_STORAGE_KEY);
+  }, [blocks, loading]);
 
   const selectedOrder = orders.find((order) => order.id === orderId) ?? null;
   const availableReservations = useMemo(() => reservations.filter((item) => item.status === "active" && (!selectedOrder || item.purchase_order_reference === selectedOrder.order_number)), [reservations, selectedOrder]);
@@ -94,12 +121,15 @@ export function InvoiceRegistrationForm({ onCreated, onCancel, template, editing
 
   const submit = async (event: FormEvent) => {
     event.preventDefault(); setError(null);
+    if (submitLock.current) return;
     const activeLines = lines.filter((line) => line.quantity > 0);
     if (!confirmed) { setError("Revisa la vista previa y confirma antes de guardar."); return; }
     if (!activeLines.length) { setError("La factura activa debe contener al menos un producto."); return; }
+    submitLock.current = true;
     setSaving(true);
+    idempotencyKey.current ??= crypto.randomUUID();
     try {
-      const created = await apiRequest<{ id: string }>(editing && template ? `/invoices/${template.id}` : "/invoices", { method: editing ? "PUT" : "POST", body: JSON.stringify({
+      const created = await apiRequest<{ id: string }>(editing && template ? `/invoices/${template.id}` : "/invoices", { method: editing ? "PUT" : "POST", headers: { "Idempotency-Key": idempotencyKey.current }, body: JSON.stringify({
         invoice_number: number, invoice_date: date, source_type: sourceType,
         purchase_order_id: sourceType === "purchase_order" ? orderId : null,
         customer_name: customer, chain_name: chain || null, authorization_number: authorization || null,
@@ -107,20 +137,75 @@ export function InvoiceRegistrationForm({ onCreated, onCancel, template, editing
         reservation_ids: sourceType === "purchase_order" ? selectedReservations : [],
         lines: activeLines.map((line) => ({ sku: line.sku, quantity: line.quantity, unit_price: line.unit_price ? Number(line.unit_price) : null })),
       }) });
+      idempotencyKey.current = null;
       await onCreated(created.id);
     } catch (caught) { setError(caught instanceof Error ? caught.message : "No pudimos registrar la factura."); }
-    finally { setSaving(false); }
+    finally { submitLock.current = false; setSaving(false); }
   };
 
-  const processBlocks = () => {
-    const parsed = parseInvoiceBlocks(bulkText, products);
-    setBlocks(parsed.map((block) => ({ ...block, order_id: "", invoice_date: today(), authorization: "", guide: "", total: "", notes: "" })));
+  const inferOrder = (block: QuickBlock, source: string) => {
+    const exact = orders.filter((order) =>
+      source.toLocaleLowerCase("es-EC").includes(order.order_number.toLocaleLowerCase("es-EC")),
+    );
+    if (exact.length === 1) return exact[0]!.id;
+    const scored = orders.map((order) => ({
+      id: order.id,
+      score: block.lines.filter((line) => line.sku && order.lines.some((item) => item.sku === line.sku)).length,
+    })).sort((a, b) => b.score - a.score);
+    return scored[0]?.score && scored[0].score > (scored[1]?.score ?? 0) ? scored[0].id : "";
+  };
+  const processText = (text: string, filename?: string) => {
+    const parsed = parseInvoiceBlocks(text, products);
+    const next = parsed.map((block) => ({
+      ...block, order_id: inferOrder(block, text), invoice_date: today(),
+      authorization: "", guide: "", total: "", notes: "", filename,
+      save_status: registeredNumbers.has(block.invoice_number) ? "duplicate" as const : "pending" as const,
+    }));
+    setBlocks((current) => [...current, ...next]);
     setBulkConfirmed(false);
     setError(parsed.length ? null : "No encontramos encabezados con el formato FAC 001-001-000000758.");
   };
+  const processBlocks = () => processText(bulkText);
+  const addFiles = (incoming: File[]) => {
+    const allowed = incoming.filter((file) =>
+      ["application/pdf", "image/jpeg", "image/png", "image/webp"].includes(file.type),
+    );
+    setFiles((current) => [...current, ...allowed].slice(0, 50));
+    if (allowed.length !== incoming.length) setError("Se ignoraron archivos que no son PDF o imagen.");
+  };
+  const processFiles = async () => {
+    if (!files.length) return;
+    setSaving(true); setError(null);
+    const pending = [...files];
+    const recognized: Array<{ filename: string; status: string; detail?: string; text: string; table_rows?: Array<{ raw: string }> }> = [];
+    const worker = async () => {
+      while (pending.length) {
+        const file = pending.shift();
+        if (!file) return;
+        const body = new FormData();
+        body.append("files", file);
+        try {
+          const result = await apiUpload<{ documents: typeof recognized }>("/invoices/imports/preview", body);
+          recognized.push(...result.documents);
+        } catch (caught) {
+          recognized.push({ filename: file.name, status: "error", detail: caught instanceof Error ? caught.message : "No se pudo reconocer.", text: "" });
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(3, files.length) }, worker));
+    recognized.forEach((document) => {
+      if (document.status === "error") {
+        setError((current) => [current, `${document.filename}: ${document.detail}`].filter(Boolean).join(" · "));
+      } else {
+        const tableText = document.table_rows?.map((row) => row.raw).join("\n") ?? "";
+        processText(`${document.text}\n${tableText}`, document.filename);
+      }
+    });
+    setFiles([]); setSaving(false);
+  };
   const patchBlock = (id: string, patch: Partial<BulkDraft>) => {
     setBulkConfirmed(false);
-    setBlocks((current) => current.map((block) => block.id === id ? { ...block, ...patch } : block));
+    setBlocks((current) => current.map((block) => block.id === id ? { ...block, ...patch, save_status: block.save_status === "saved" ? "saved" : "pending", save_detail: undefined } : block));
   };
   const patchBlockLine = (blockId: string, lineId: string, patch: Partial<QuickLine>) => {
     setBulkConfirmed(false);
@@ -161,7 +246,7 @@ export function InvoiceRegistrationForm({ onCreated, onCancel, template, editing
     const errors: string[] = [];
     if (!invoicePattern.test(block.invoice_number)) errors.push("Número de factura inválido.");
     if ((numberCounts[block.invoice_number] ?? 0) > 1) errors.push("Número repetido dentro de esta carga.");
-    if (registeredNumbers.has(block.invoice_number)) errors.push("Esta factura ya está registrada.");
+    if (registeredNumbers.has(block.invoice_number) || block.save_status === "duplicate") errors.push("Posible duplicado: esta factura ya está registrada.");
     if (!block.order_id) errors.push("Selecciona la OC.");
     if (!block.invoice_date) errors.push("Selecciona la fecha.");
     if (!block.is_void && !block.lines.length) errors.push("La factura activa necesita productos.");
@@ -174,7 +259,7 @@ export function InvoiceRegistrationForm({ onCreated, onCancel, template, editing
     const bySku = new Map(order.lines.map((line) => [line.sku, line.remaining_quantity]));
     return block.lines.filter((line) => line.sku && line.quantity !== bySku.get(line.sku)).length;
   };
-  const allErrors = blocks.reduce((sum, block) => sum + blockErrors(block).length, 0);
+  const validBlocks = blocks.filter((block) => !["saved", "duplicate"].includes(block.save_status ?? "") && blockErrors(block).length === 0);
   const totalUnits = blocks.reduce((sum, block) => sum + block.lines.reduce((lineSum, line) => lineSum + (line.quantity ?? 0), 0), 0);
   const previousBySku = new Map(template?.lines.map((line) => [line.sku, line.invoiced]) ?? []);
   const changedLines = editing ? lines.filter((line) => previousBySku.get(line.sku) !== line.quantity).length : 0;
@@ -187,11 +272,13 @@ export function InvoiceRegistrationForm({ onCreated, onCancel, template, editing
   };
 
   const saveBulk = async () => {
-    if (!bulkConfirmed || allErrors || !blocks.length) return;
+    if (!bulkConfirmed || !validBlocks.length) return;
     setSaving(true); setError(null);
+    const savingIds = new Set(validBlocks.map((block) => block.id));
+    setBlocks((current) => current.map((block) => savingIds.has(block.id) ? { ...block, save_status: "processing" } : block));
     try {
-      const created = await apiRequest<{ invoices: Array<{ id: string }> }>("/invoices/bulk", {
-        method: "POST", body: JSON.stringify({ invoices: blocks.map((block) => ({
+      const created = await apiRequest<{ invoices: Array<{ id?: string; invoice_number: string; status: "saved" | "duplicate" | "error"; detail?: string }>; summary: { saved: number; duplicates: number; errors: number } }>("/invoices/bulk", {
+        method: "POST", body: JSON.stringify({ batch_id: bulkId, invoices: validBlocks.map((block) => ({
           invoice_number: block.invoice_number, invoice_date: block.invoice_date,
           purchase_order_id: block.order_id, is_void: block.is_void,
           authorization_number: block.authorization || null, remittance_guide: block.guide || null,
@@ -199,7 +286,16 @@ export function InvoiceRegistrationForm({ onCreated, onCancel, template, editing
           lines: block.is_void ? [] : block.lines.map((line) => ({ sku: line.sku, quantity: line.quantity })),
         })) }),
       });
-      await onCreated(created.invoices[0]!.id);
+      const byNumber = new Map(created.invoices.map((item) => [item.invoice_number, item]));
+      setBlocks((current) => current.map((block) => {
+        const result = byNumber.get(block.invoice_number);
+        return result ? { ...block, save_status: result.status, save_detail: result.detail } : block;
+      }));
+      setRegisteredNumbers((current) => new Set([...current, ...created.invoices.filter((item) => item.status !== "error").map((item) => item.invoice_number)]));
+      const firstSaved = created.invoices.find((item) => item.status === "saved" && item.id);
+      setBulkMessage(`${created.summary.saved} guardadas, ${created.summary.duplicates} duplicadas y ${created.summary.errors} con error.`);
+      if (firstSaved?.id && created.summary.errors === 0) await onCreated(firstSaved.id);
+      if (created.summary.errors) setError("Las facturas con error permanecen en la bandeja para corregirlas y reintentar.");
     } catch (caught) { setError(caught instanceof Error ? caught.message : "No pudimos guardar la carga."); }
     finally { setSaving(false); }
   };
@@ -210,6 +306,7 @@ export function InvoiceRegistrationForm({ onCreated, onCancel, template, editing
       <div className="mode-switch" role="group" aria-label="Modo de factura"><button type="button" className={mode === "individual" ? "active" : ""} onClick={() => setMode("individual")}>Factura individual</button><button type="button" className={mode === "bulk" ? "active" : ""} onClick={() => setMode("bulk")}>Carga rápida por bloques</button></div>
     </div>
     {error && <div className="message error" role="alert">{error}</div>}
+    {bulkMessage && <div className="message success" role="status">{bulkMessage}</div>}
 
     {mode === "individual" && <form onSubmit={submit}>
       <div className="form-grid">
@@ -245,18 +342,24 @@ export function InvoiceRegistrationForm({ onCreated, onCancel, template, editing
     </form>}
 
     {mode === "bulk" && <div className="bulk-entry">
+      <section className={`quick-paste-panel invoice-drop-zone ${dragging ? "dragging" : ""}`} onDragOver={(event: DragEvent<HTMLElement>) => { event.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={(event: DragEvent<HTMLElement>) => { event.preventDefault(); setDragging(false); addFiles(Array.from(event.dataTransfer.files)); }}>
+        <label><span>PDF o imágenes (hasta 50)</span><input multiple accept=".pdf,.jpg,.jpeg,.png,.webp" type="file" onChange={(event: ChangeEvent<HTMLInputElement>) => addFiles(Array.from(event.target.files ?? []))} /></label>
+        <p>Arrastra aquí un grupo de archivos o una carpeta cuando el navegador lo permita. Se procesan con concurrencia controlada.</p>
+        {files.length > 0 && <div><strong>{files.length} documentos listos</strong> <button className="secondary-button" type="button" disabled={saving} onClick={processFiles}>{saving ? "Reconociendo…" : "Reconocer documentos"}</button></div>}
+      </section>
       <section className="quick-paste-panel"><label><span>Pega una o varias facturas</span><textarea rows={10} value={bulkText} onChange={(event) => { setBulkText(event.target.value); setBulkConfirmed(false); }} placeholder={"FAC 001-001-000000758\n480.00 TOALLITAS HÚMEDAS ANA X 100 - ACP001\n\nFAC 001-001-000000759\nANULADA"} /></label><button className="secondary-button" type="button" onClick={processBlocks}>Pegar y procesar información</button></section>
       <div className="line-heading bulk-toolbar"><h3>Vista previa por factura</h3><div><button className="text-button" type="button" onClick={retryBlocks}>Reintentar reconocimiento</button><button className="text-button" type="button" onClick={addEmptyBlock}>+ Agregar bloque</button></div></div>
-      {blocks.length > 0 && <div className="bulk-summary"><div><span>Total facturas</span><strong>{blocks.length}</strong></div><div><span>Válidas</span><strong>{blocks.filter((block) => !block.is_void && !blockErrors(block).length).length}</strong></div><div><span>Anuladas</span><strong>{blocks.filter((block) => block.is_void).length}</strong></div><div><span>Con errores</span><strong>{blocks.filter((block) => blockErrors(block).length).length}</strong></div><div><span>Total unidades</span><strong>{totalUnits}</strong></div></div>}
+      {blocks.length > 0 && <div className="bulk-summary"><div><span>Documentos</span><strong>{blocks.length}</strong></div><div><span>Reconocidos</span><strong>{validBlocks.length}</strong></div><div><span>Requieren revisión</span><strong>{blocks.filter((block) => blockErrors(block).length && block.save_status !== "duplicate").length}</strong></div><div><span>Duplicados</span><strong>{blocks.filter((block) => block.save_status === "duplicate" || registeredNumbers.has(block.invoice_number)).length}</strong></div><div><span>Procesando</span><strong>{blocks.filter((block) => block.save_status === "processing").length}</strong></div><div><span>Guardadas</span><strong>{blocks.filter((block) => block.save_status === "saved").length}</strong></div><div><span>Total unidades</span><strong>{totalUnits}</strong></div></div>}
       <div className="invoice-blocks">{blocks.map((block, index) => { const order = orders.find((item) => item.id === block.order_id); const errors = blockErrors(block); const differences = differenceCount(block); return <article className={`invoice-block ${errors.length ? "with-errors" : block.is_void ? "is-void" : differences ? "with-warning" : "valid"}`} key={block.id}>
-        <header><div><span className="status-pill">{block.is_void ? "Anulada" : errors.length ? "Con errores" : differences ? "Con observaciones" : "Válida"}</span><h3>Factura {index + 1}</h3></div><div className="block-actions">{!block.is_void && <button type="button" onClick={() => patchBlock(block.id, { lines: [...block.lines, { id: `line-new-${Date.now()}`, raw: "Producto agregado", quantity: 1, sku: "", error: "Selecciona un producto.", suggestions: [] }] })}>Agregar producto</button>}<button type="button" onClick={() => duplicateBlock(block)}>Duplicar</button><button type="button" onClick={() => patchBlock(block.id, { is_void: !block.is_void })}>{block.is_void ? "Activar" : "Anular"}</button><button type="button" onClick={() => setBlocks((current) => current.filter((item) => item.id !== block.id))}>Eliminar</button></div></header>
+        <header><div><span className="status-pill">{block.save_status === "saved" ? "Guardada" : block.save_status === "processing" ? "Procesando" : block.save_status === "duplicate" ? "Posible duplicado" : block.save_status === "error" ? "Error" : block.is_void ? "Anulada" : errors.length ? "Requiere revisión" : differences ? "Lista con diferencias" : "Lista para guardar"}</span><h3>Factura {index + 1}</h3></div><div className="block-actions">{!block.is_void && <button type="button" onClick={() => patchBlock(block.id, { lines: [...block.lines, { id: `line-new-${Date.now()}`, raw: "Producto agregado", quantity: 1, sku: "", error: "Selecciona un producto.", suggestions: [] }] })}>Agregar producto</button>}<button type="button" onClick={() => duplicateBlock(block)}>Duplicar</button><button type="button" onClick={() => patchBlock(block.id, { is_void: !block.is_void })}>{block.is_void ? "Activar" : "Anular"}</button><button type="button" onClick={() => setBlocks((current) => current.filter((item) => item.id !== block.id))}>Eliminar</button></div></header>
         <div className="form-grid compact"><label><span>Número *</span><input value={block.invoice_number} onChange={(event) => patchBlock(block.id, { invoice_number: event.target.value })} /></label><label><span>OC *</span><select value={block.order_id} onChange={(event) => patchBlock(block.id, { order_id: event.target.value })}><option value="">Selecciona la OC</option>{orders.map((item) => <option key={item.id} value={item.id}>{item.chain_name} · {item.order_number}</option>)}</select></label><label><span>Cliente/Cadena</span><input readOnly value={order ? order.customer_name ?? order.chain_name : ""} /></label><label><span>Fecha *</span><input type="date" value={block.invoice_date} onChange={(event) => patchBlock(block.id, { invoice_date: event.target.value })} /></label><label><span>Autorización</span><input value={block.authorization} onChange={(event) => patchBlock(block.id, { authorization: event.target.value })} /></label><label><span>Guía</span><input value={block.guide} onChange={(event) => patchBlock(block.id, { guide: event.target.value })} /></label><label><span>Valor total</span><input type="number" min="0" step="0.01" value={block.total} onChange={(event) => patchBlock(block.id, { total: event.target.value })} /></label></div>
         {!block.is_void && <div className="block-lines">{block.lines.map((line) => <div className={!line.sku || !line.quantity ? "unrecognized-line" : ""} key={line.id}><label><span>{line.raw}</span><select value={line.sku} onChange={(event) => confirmBulkProduct(line.id, line.raw, event.target.value)}><option value="">Producto no reconocido</option>{products.map((product) => <option key={product.id} value={product.sku}>{product.sku} · {product.product_name}</option>)}</select>{line.suggestions.length > 0 && <small>Sugerencias: {line.suggestions.join(", ")}</small>}</label><label><span>Unidades</span><input type="number" min={1} value={line.quantity ?? ""} onChange={(event) => patchBlockLine(block.id, line.id, { quantity: Number(event.target.value) })} /></label><button type="button" aria-label="Eliminar línea" onClick={() => patchBlock(block.id, { lines: block.lines.filter((item) => item.id !== line.id) })}>×</button>{line.error && <small className="field-error">{line.error}</small>}</div>)}</div>}
         <footer><span>{block.lines.length} productos · {block.lines.reduce((sum, line) => sum + (line.quantity ?? 0), 0)} unidades</span><span>{differences} diferencias frente a la OC</span></footer>
+        {(block.filename || block.save_status || block.save_detail) && <p><strong>{block.save_status === "saved" ? "Guardada" : block.save_status === "processing" ? "Procesando" : block.save_status === "duplicate" ? "Posible duplicado" : block.save_status === "error" ? "Error" : "Pendiente"}</strong>{block.filename ? ` · ${block.filename}` : ""}{block.save_detail ? ` · ${block.save_detail}` : ""}</p>}
         {errors.length > 0 && <ul className="block-errors">{errors.map((item) => <li key={item}>{item}</li>)}</ul>}
       </article>; })}</div>
-      {blocks.length > 0 && <label className="preview-confirm"><input type="checkbox" checked={bulkConfirmed} disabled={allErrors > 0} onChange={(event) => setBulkConfirmed(event.target.checked)} /><span>{allErrors ? "Corrige todos los errores obligatorios para confirmar." : "Revisé todos los bloques y confirmo las advertencias y diferencias permitidas."}</span></label>}
-      <div className="form-actions"><button className="secondary-button" type="button" onClick={onCancel}>Cancelar</button><button className="primary-button" type="button" disabled={saving || !blocks.length || allErrors > 0 || !bulkConfirmed} onClick={saveBulk}>{saving ? "Guardando carga…" : "Confirmar y guardar todas"}</button></div>
+      {blocks.length > 0 && <label className="preview-confirm"><input type="checkbox" checked={bulkConfirmed} disabled={!validBlocks.length} onChange={(event) => setBulkConfirmed(event.target.checked)} /><span>{validBlocks.length ? `Confirmar las ${validBlocks.length} facturas válidas; las excepciones permanecerán pendientes.` : "Corrige al menos una factura pendiente para continuar."}</span></label>}
+      <div className="form-actions"><button className="secondary-button" type="button" onClick={onCancel}>Salir (el lote queda guardado)</button><button className="secondary-button" type="button" onClick={() => setBlocks((current) => current.map((block) => block.save_status === "error" ? { ...block, save_status: "pending", save_detail: undefined } : block))}>Reintentar errores</button><button className="primary-button" type="button" disabled={saving || !validBlocks.length || !bulkConfirmed} onClick={saveBulk}>{saving ? "Guardando carga…" : `Guardar ${validBlocks.length} válidas`}</button></div>
     </div>}
   </section>;
 }

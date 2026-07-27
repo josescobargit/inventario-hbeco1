@@ -3,7 +3,7 @@ import uuid
 from datetime import date
 from decimal import Decimal
 from typing import Annotated, Literal
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, Header, HTTPException, UploadFile
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
@@ -26,6 +26,7 @@ from app.modules.purchase_orders.infrastructure.models import (
     PurchaseOrder,
     PurchaseOrderLine,
 )
+from app.modules.purchase_orders.domain.document_extraction import extract_document
 from app.modules.reservations.infrastructure.models import Reservation, ReservationLine
 from app.modules.settings.domain.operational import exception_invoices_allowed
 
@@ -101,16 +102,69 @@ class QuickInvoiceInput(BaseModel):
 
 class BulkInvoiceInput(BaseModel):
     invoices: list[QuickInvoiceInput] = Field(min_length=1, max_length=100)
-
-    @model_validator(mode="after")
-    def unique_numbers(self):
-        numbers = [item.invoice_number for item in self.invoices]
-        if len(numbers) != len(set(numbers)):
-            raise ValueError("La carga contiene números de factura repetidos.")
-        return self
+    batch_id: uuid.UUID = Field(default_factory=uuid.uuid4)
 
 
 router = APIRouter(prefix="/invoices", tags=["Facturas emitidas"])
+
+ALLOWED_IMPORT_TYPES = {
+    "application/pdf",
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+}
+MAX_IMPORT_BYTES = 15 * 1024 * 1024
+
+
+@router.post("/imports/preview")
+async def preview_invoice_documents(
+    _user: CurrentUser,
+    files: Annotated[list[UploadFile], File()],
+):
+    if not files:
+        raise HTTPException(status_code=422, detail="Selecciona al menos un documento.")
+    if len(files) > 50:
+        raise HTTPException(status_code=422, detail="Procesa hasta 50 documentos por lote.")
+    documents = []
+    for upload in files:
+        content_type = (upload.content_type or "").lower()
+        if content_type not in ALLOWED_IMPORT_TYPES:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{upload.filename}: usa PDF, JPG, JPEG, PNG o WEBP.",
+            )
+        content = await upload.read(MAX_IMPORT_BYTES + 1)
+        if len(content) > MAX_IMPORT_BYTES:
+            raise HTTPException(
+                status_code=413, detail=f"{upload.filename}: supera el límite de 15 MB."
+            )
+        try:
+            extracted = extract_document(
+                content, content_type, upload.filename or "documento"
+            )
+        except Exception as error:
+            documents.append(
+                {
+                    "filename": upload.filename or "documento",
+                    "status": "error",
+                    "detail": str(error),
+                    "text": "",
+                    "table_rows": [],
+                }
+            )
+            continue
+        documents.append(
+            {
+                "filename": upload.filename or "documento",
+                "status": "recognized",
+                "text": extracted.text,
+                "table_rows": extracted.table_rows,
+                "extraction_method": extracted.method,
+                "page_count": extracted.page_count,
+                "warnings": extracted.warnings,
+            }
+        )
+    return {"documents": documents}
 
 
 @router.get("")
@@ -126,6 +180,8 @@ def _register_invoice(
     db: Session,
     *,
     commit: bool,
+    idempotency_key: str | None = None,
+    batch_id: uuid.UUID | None = None,
 ):
     if payload.source_type != "purchase_order" and not exception_invoices_allowed(db):
         raise HTTPException(
@@ -234,6 +290,8 @@ def _register_invoice(
                 )
     invoice = Invoice(
         invoice_number=payload.invoice_number,
+        idempotency_key=idempotency_key,
+        batch_id=batch_id,
         invoice_date=payload.invoice_date,
         purchase_order_id=payload.purchase_order_id,
         source_type=payload.source_type,
@@ -310,6 +368,8 @@ def _register_invoice(
                 movement_type="invoice_registered",
                 reference_type="invoice",
                 reference_id=str(invoice.id),
+                idempotency_key=f"invoice:{payload.invoice_number}:{sku}",
+                batch_id=batch_id,
                 reason="Factura emitida en Contífico registrada",
                 before_value=before,
                 after_value={
@@ -349,9 +409,33 @@ def _register_invoice(
 
 @router.post("", status_code=201)
 def register_invoice(
-    payload: InvoiceInput, user: CurrentUser, db: Annotated[Session, Depends(get_db)]
+    payload: InvoiceInput,
+    user: CurrentUser,
+    db: Annotated[Session, Depends(get_db)],
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ):
-    return _register_invoice(payload, user, db, commit=True)
+    # The invoice number remains the durable business key; the request key is
+    # also persisted so a retry can be audited and resolved to the same result.
+    existing = db.scalar(
+        select(Invoice).where(Invoice.invoice_number == payload.invoice_number)
+    )
+    if existing is None and idempotency_key:
+        existing = db.scalar(
+            select(Invoice).where(Invoice.idempotency_key == idempotency_key)
+        )
+    if existing is not None:
+        return {
+            "id": existing.id,
+            "invoice_number": existing.invoice_number,
+            "incident_status": existing.incident_status,
+            "dispatch_status": existing.dispatch_status,
+            "duplicate": True,
+            "idempotency_key": idempotency_key,
+        }
+    result = _register_invoice(
+        payload, user, db, commit=True, idempotency_key=idempotency_key
+    )
+    return {**result, "duplicate": False, "idempotency_key": idempotency_key}
 
 
 @router.post("/bulk", status_code=201)
@@ -360,23 +444,22 @@ def register_bulk_invoices(
     user: CurrentUser,
     db: Annotated[Session, Depends(get_db)],
 ):
-    existing = set(
-        db.scalars(
-            select(Invoice.invoice_number).where(
-                Invoice.invoice_number.in_(
-                    [item.invoice_number for item in payload.invoices]
-                )
-            )
-        ).all()
-    )
-    if existing:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Facturas ya registradas: {', '.join(sorted(existing))}.",
-        )
     results = []
-    try:
-        for item in payload.invoices:
+    for item in payload.invoices:
+        existing = db.scalar(
+            select(Invoice).where(Invoice.invoice_number == item.invoice_number)
+        )
+        if existing is not None:
+            results.append(
+                {
+                    "id": existing.id,
+                    "invoice_number": existing.invoice_number,
+                    "status": "duplicate",
+                    "detail": "Esta factura ya está registrada.",
+                }
+            )
+            continue
+        try:
             po = db.get(PurchaseOrder, item.purchase_order_id)
             if po is None:
                 raise HTTPException(
@@ -387,6 +470,8 @@ def register_bulk_invoices(
             if item.is_void:
                 invoice = Invoice(
                     invoice_number=item.invoice_number,
+                    idempotency_key=f"{payload.batch_id}:{item.invoice_number}",
+                    batch_id=payload.batch_id,
                     invoice_date=item.invoice_date,
                     purchase_order_id=po.id,
                     source_type="purchase_order",
@@ -417,33 +502,60 @@ def register_bulk_invoices(
                         "id": invoice.id,
                         "invoice_number": invoice.invoice_number,
                         "administrative_status": "cancelled",
+                        "status": "saved",
                     }
                 )
-                continue
-            result = _register_invoice(
-                InvoiceInput(
-                    invoice_number=item.invoice_number,
-                    invoice_date=item.invoice_date,
-                    purchase_order_id=po.id,
-                    source_type="purchase_order",
-                    customer_name=customer,
-                    chain_name=po.chain_name,
-                    authorization_number=item.authorization_number,
-                    remittance_guide=item.remittance_guide,
-                    total_value=item.total_value,
-                    notes=item.notes,
-                    lines=item.lines,
-                ),
-                user,
-                db,
-                commit=False,
+            else:
+                result = _register_invoice(
+                    InvoiceInput(
+                        invoice_number=item.invoice_number,
+                        invoice_date=item.invoice_date,
+                        purchase_order_id=po.id,
+                        source_type="purchase_order",
+                        customer_name=customer,
+                        chain_name=po.chain_name,
+                        authorization_number=item.authorization_number,
+                        remittance_guide=item.remittance_guide,
+                        total_value=item.total_value,
+                        notes=item.notes,
+                        lines=item.lines,
+                    ),
+                    user,
+                    db,
+                    commit=False,
+                    idempotency_key=f"{payload.batch_id}:{item.invoice_number}",
+                    batch_id=payload.batch_id,
+                )
+                results.append({**result, "status": "saved"})
+            # Each document is its own atomic unit. Its invoice, lines,
+            # movements, reservations and audit record commit together.
+            db.commit()
+        except HTTPException as caught:
+            db.rollback()
+            results.append(
+                {
+                    "invoice_number": item.invoice_number,
+                    "status": "error",
+                    "detail": str(caught.detail),
+                }
             )
-            results.append(result)
-        db.commit()
-    except Exception:
-        db.rollback()
-        raise
-    return {"invoices": results}
+        except Exception:
+            db.rollback()
+            results.append(
+                {
+                    "invoice_number": item.invoice_number,
+                    "status": "error",
+                    "detail": "No se pudo guardar esta factura.",
+                }
+            )
+    return {
+        "invoices": results,
+        "summary": {
+            "saved": sum(item["status"] == "saved" for item in results),
+            "duplicates": sum(item["status"] == "duplicate" for item in results),
+            "errors": sum(item["status"] == "error" for item in results),
+        },
+    }
 
 
 @router.put("/{invoice_id}")

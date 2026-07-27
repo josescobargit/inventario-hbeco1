@@ -67,7 +67,7 @@ def test_active_invoice_requires_products_and_void_rejects_them() -> None:
         )
 
 
-def test_bulk_rejects_duplicate_numbers_but_allows_multiple_invoices_for_one_po() -> (
+def test_bulk_accepts_duplicate_candidates_for_per_item_idempotency_results() -> (
     None
 ):
     po_id = "00000000-0000-0000-0000-000000000001"
@@ -82,5 +82,5 @@ def test_bulk_rejects_duplicate_numbers_but_allows_multiple_invoices_for_one_po(
     assert (
         payload.invoices[0].purchase_order_id == payload.invoices[1].purchase_order_id
     )
-    with pytest.raises(ValidationError):
-        BulkInvoiceInput(invoices=[first, first])
+    retry_payload = BulkInvoiceInput(invoices=[first, first])
+    assert len(retry_payload.invoices) == 2

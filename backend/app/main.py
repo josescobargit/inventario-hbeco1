@@ -26,7 +26,7 @@ def create_app() -> FastAPI:
         allow_origin_regex=settings.cors_origin_regex,
         allow_credentials=True,
         allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE"],
-        allow_headers=["Content-Type", "X-Requested-With"],
+        allow_headers=["Content-Type", "X-Requested-With", "Idempotency-Key"],
     )
     application.include_router(api_router, prefix=settings.api_prefix)
 

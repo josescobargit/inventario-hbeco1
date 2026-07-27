@@ -95,6 +95,10 @@ class InventoryMovement(Base):
     movement_type: Mapped[str] = mapped_column(String(60), nullable=False, index=True)
     reference_type: Mapped[str | None] = mapped_column(String(60), nullable=True)
     reference_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(
+        String(160), unique=True, nullable=True, index=True
+    )
+    batch_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True, index=True)
     reason: Mapped[str] = mapped_column(Text, nullable=False)
     before_value: Mapped[dict[str, Any]] = mapped_column(json_type, nullable=False)
     after_value: Mapped[dict[str, Any]] = mapped_column(json_type, nullable=False)

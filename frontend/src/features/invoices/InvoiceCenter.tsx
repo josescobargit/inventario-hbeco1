@@ -73,6 +73,7 @@ export function InvoiceCenter() {
   const [showForm, setShowForm] = useState(false);
   const [template, setTemplate] = useState<InvoiceTemplate | null>(null);
   const [editing, setEditing] = useState(false);
+  const [success, setSuccess] = useState<string | null>(null);
 
   useEffect(() => {
     apiRequest<InvoiceSummary[]>("/invoices")
@@ -109,12 +110,23 @@ export function InvoiceCenter() {
   }, [invoices, search]);
 
   const invoiceCreated = async (id: string) => {
-    const refreshed = await apiRequest<InvoiceSummary[]>("/invoices");
-    setInvoices(refreshed);
+    // The POST has already committed at this point. Close the form and select
+    // the durable id first; a secondary refresh failure must never turn a
+    // successful save into an apparent failure or invite a duplicate retry.
     setShowForm(false);
     setTemplate(null);
     setEditing(false);
     selectInvoice(id);
+    setSuccess("Factura registrada correctamente");
+    setError(null);
+    try {
+      const refreshed = await apiRequest<InvoiceSummary[]>("/invoices");
+      setInvoices(refreshed);
+    } catch (caught) {
+      setError(caught instanceof Error
+        ? `La factura se guardó, pero no pudimos actualizar el listado: ${caught.message}`
+        : "La factura se guardó, pero no pudimos actualizar el listado.");
+    }
   };
 
   const populateFromTrace = (edit: boolean) => {
@@ -144,6 +156,7 @@ export function InvoiceCenter() {
         <button className="primary-button" type="button" onClick={() => { setShowForm((value) => !value); setTemplate(null); setEditing(false); setError(null); }}>{showForm ? "Volver al centro" : "Registrar factura"}</button>
       </section>
 
+      {success && <div className="message success" role="status">{success}</div>}
       {error && <div className="message error" role="alert">{error}</div>}
       {showForm ? <InvoiceRegistrationForm onCreated={invoiceCreated} onCancel={() => { setShowForm(false); setTemplate(null); setEditing(false); }} template={template} editing={editing} /> : <section className="invoice-workspace">
         <aside className="invoice-list" aria-label="Facturas registradas">

@@ -1601,6 +1601,16 @@ td:first-child span, td:nth-child(6) span { color: var(--muted); }
 .message.error { border-color: #fecaca; color: #b91c1c; background: #fff1f2; }
 .message.success { border-color: #bbf7d0; color: #047857; background: #f0fdf4; }
 
+.invoice-drop-zone {
+  border: 2px dashed var(--border);
+  transition: border-color .15s ease, background .15s ease;
+}
+
+.invoice-drop-zone.dragging {
+  border-color: var(--primary);
+  background: #f0f7ff;
+}
+
 .operation-definition span,
 .draft-line,
 .invoice-draft-line,

@@ -31,6 +31,10 @@ class Invoice(Base):
     invoice_number: Mapped[str] = mapped_column(
         String(17), unique=True, nullable=False, index=True
     )
+    idempotency_key: Mapped[str | None] = mapped_column(
+        String(100), unique=True, nullable=True, index=True
+    )
+    batch_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True, index=True)
     invoice_date: Mapped[date] = mapped_column(Date, nullable=False)
     purchase_order_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid, ForeignKey("purchase_orders.id", ondelete="RESTRICT"), index=True
