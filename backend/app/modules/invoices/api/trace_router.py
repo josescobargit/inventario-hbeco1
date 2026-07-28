@@ -95,9 +95,11 @@ def traceability(
                 "delivered": delivered,
                 "rejected_delivery": rejected,
                 "returned": returned,
-                "returnable": dispatched - returned,
+                "returnable": delivered - returned,
                 "pending_dispatch": line.quantity - dispatched - missing,
                 "pending_delivery": dispatched - delivered - rejected,
+                "pending_confirmation": line.quantity - delivered,
+                "delivery_difference": delivered - line.quantity,
                 "outside_purchase_order": line.outside_purchase_order,
             }
         )
@@ -133,6 +135,7 @@ def traceability(
                 "id": item.id,
                 "reason": item.reason,
                 "returned_at": item.returned_at,
+                "delivery_id": item.delivery_id,
                 "lines": return_lines,
             }
         )

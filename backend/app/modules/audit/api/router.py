@@ -23,6 +23,7 @@ ACTION_LABELS = {
     "purchase_order_created": "OC registrada",
     "purchase_order_updated": "OC actualizada",
     "invoice_registered": "Factura registrada",
+    "invoice_cancelled": "Factura anulada",
     "dispatch_confirmed": "Despacho confirmado",
     "delivery_registered": "Entrega registrada",
     "reservation_created": "Reserva creada",
@@ -39,6 +40,9 @@ ACTION_LABELS = {
     "settings_updated": "Configuración actualizada",
     "product_created": "Producto creado",
     "product_updated": "Producto actualizado",
+    "supplier_invoice_registered": "Factura de proveedor registrada",
+    "supplier_invoice_edited": "Factura de proveedor corregida",
+    "supplier_invoice_cancelled": "Factura de proveedor anulada",
 }
 
 ENTITY_LABELS = {
@@ -57,6 +61,7 @@ ENTITY_LABELS = {
     "invoice_adjustment": "Facturación",
     "settings": "Configuración",
     "product": "Catálogo",
+    "supplier_invoice": "Ingresos",
 }
 
 

@@ -120,21 +120,12 @@ def confirm_dispatch(
                 status_code=409,
                 detail=f"{product.sku}: quedan {remaining} unidades pendientes y se intentan reportar {reported}.",
             )
-        if report.dispatched_quantity > position.physical_confirmed:
+        legacy_inventory = invoice.inventory_applied_at is None
+        if legacy_inventory and report.dispatched_quantity > position.physical_confirmed:
             raise HTTPException(
                 status_code=409,
                 detail=f"{product.sku}: el despacho dejaría stock físico negativo.",
             )
-        before = {
-            "physical_confirmed": position.physical_confirmed,
-            "invoiced_not_dispatched": position.invoiced_not_dispatched,
-            "blocked_by_incident": position.blocked_by_incident,
-            "version": position.version,
-        }
-        position.physical_confirmed -= report.dispatched_quantity
-        position.invoiced_not_dispatched -= reported
-        position.blocked_by_incident += report.missing_quantity
-        position.version += 1
         line = DispatchLine(
             dispatch_id=dispatch.id,
             invoice_line_id=invoice_line.id,
@@ -146,7 +137,9 @@ def confirm_dispatch(
         if report.missing_quantity:
             db.add(
                 Incident(
-                    incident_type="missing_stock",
+                    incident_type=(
+                        "missing_stock" if legacy_inventory else "delivery_issue"
+                    ),
                     invoice_id=invoice.id,
                     purchase_order_id=invoice.purchase_order_id,
                     product_id=product.id,
@@ -156,24 +149,37 @@ def confirm_dispatch(
                 )
             )
             invoice.incident_status = "open"
-        db.add(
-            InventoryMovement(
-                warehouse_id=position.warehouse_id,
-                product_id=product.id,
-                actor_user_id=user.id,
-                movement_type="dispatch_confirmed",
-                reference_type="dispatch",
-                reference_id=str(dispatch.id),
-                reason=payload.notes or "Despacho confirmado",
-                before_value=before,
-                after_value={
-                    "physical_confirmed": position.physical_confirmed,
-                    "invoiced_not_dispatched": position.invoiced_not_dispatched,
-                    "blocked_by_incident": position.blocked_by_incident,
-                    "version": position.version,
-                },
+        if legacy_inventory:
+            before = {
+                "physical_confirmed": position.physical_confirmed,
+                "invoiced_not_dispatched": position.invoiced_not_dispatched,
+                "blocked_by_incident": position.blocked_by_incident,
+                "version": position.version,
+            }
+            position.physical_confirmed -= report.dispatched_quantity
+            position.invoiced_not_dispatched -= reported
+            position.blocked_by_incident += report.missing_quantity
+            position.version += 1
+            db.add(
+                InventoryMovement(
+                    warehouse_id=position.warehouse_id,
+                    product_id=product.id,
+                    purchase_order_id=invoice.purchase_order_id,
+                    actor_user_id=user.id,
+                    movement_type="dispatch_confirmed",
+                    reference_type="dispatch",
+                    reference_id=str(dispatch.id),
+                    quantity=reported,
+                    reason=payload.notes or "Despacho confirmado",
+                    before_value=before,
+                    after_value={
+                        "physical_confirmed": position.physical_confirmed,
+                        "invoiced_not_dispatched": position.invoiced_not_dispatched,
+                        "blocked_by_incident": position.blocked_by_incident,
+                        "version": position.version,
+                    },
+                )
             )
-        )
     db.flush()
     invoice_total = db.scalar(
         select(func.coalesce(func.sum(InvoiceLine.quantity), 0)).where(

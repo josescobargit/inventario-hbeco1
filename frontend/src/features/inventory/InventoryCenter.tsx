@@ -4,6 +4,7 @@ import { apiRequest } from "../../api/client";
 import { ProductIdentity } from "./ProductIdentity";
 
 interface Availability { sku: string; product_name: string; category: string; physical_confirmed: number; reserved: number; invoiced_not_dispatched: number; blocked_by_incident: number; available_to_invoice: number; units_per_box: number; physical_boxes: number; available_boxes: number; status: "available" | "low_stock" | "out_of_stock" | "blocked" }
+interface InventoryEffect { sku: string; physical_confirmed: number; available_to_invoice: number }
 const statusLabel = { available: "Disponible", low_stock: "Stock bajo", out_of_stock: "Sin stock", blocked: "Bloqueado" };
 
 export function InventoryCenter() {
@@ -16,6 +17,26 @@ export function InventoryCenter() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => { let active = true; apiRequest<Availability[]>("/inventory/availability").then((data) => { if (active) { setProducts(data); setError(null); } }).catch((caught) => { if (active) setError(caught instanceof Error ? caught.message : "No se pudo cargar la información. Intenta nuevamente."); }).finally(() => { if (active) setLoading(false); }); return () => { active = false; }; }, []);
+  useEffect(() => {
+    const update = (event: Event) => {
+      const effects = (event as CustomEvent<InventoryEffect[]>).detail ?? [];
+      const bySku = new Map(effects.map((effect) => [effect.sku, effect]));
+      setProducts((current) => current.map((product) => {
+        const effect = bySku.get(product.sku);
+        if (!effect) return product;
+        return {
+          ...product,
+          physical_confirmed: effect.physical_confirmed,
+          available_to_invoice: effect.available_to_invoice,
+          physical_boxes: effect.physical_confirmed / product.units_per_box,
+          available_boxes: effect.available_to_invoice / product.units_per_box,
+          status: effect.available_to_invoice <= 0 ? "out_of_stock" : product.status,
+        };
+      }));
+    };
+    window.addEventListener("inventario:inventory-changed", update);
+    return () => window.removeEventListener("inventario:inventory-changed", update);
+  }, []);
   const categories = useMemo(() => Array.from(new Set(products.map((product) => product.category))).sort(), [products]);
   const visibleProducts = useMemo(() => { const term = search.trim().toLocaleLowerCase("es-EC"); return products.filter((product) => {
     const matchesSearch = !term || product.sku.toLocaleLowerCase("es-EC").includes(term) || product.product_name.toLocaleLowerCase("es-EC").includes(term);

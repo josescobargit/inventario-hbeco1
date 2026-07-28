@@ -8,6 +8,7 @@ interface TraceLine { sku: string; product_name: string; dispatched: number; ret
 interface Trace {
   invoice: { number: string; customer: string; total_value: string | null; net_value: string | number; statuses: Record<string, string> };
   lines: TraceLine[];
+  deliveries: Array<{ id: string; delivered_at: string; recipient: string | null }>;
   returns: Array<{ id: string; reason: string; returned_at: string; lines: Array<{ sku: string; quantity: number; disposition: string }> }>;
   adjustments: Array<{ id: string; document_type: string; document_number: string; document_date: string; value: string; reason: string }>;
 }
@@ -26,6 +27,7 @@ export function PostSaleCenter() {
   const [trace, setTrace] = useState<Trace | null>(null);
   const [drafts, setDrafts] = useState<ReturnDraft[]>([]);
   const [returnReason, setReturnReason] = useState("");
+  const [deliveryId, setDeliveryId] = useState("");
   const [documentType, setDocumentType] = useState("credit_note");
   const [documentNumber, setDocumentNumber] = useState("");
   const [documentDate, setDocumentDate] = useState("");
@@ -45,6 +47,7 @@ export function PostSaleCenter() {
 
   const loadTrace = async (id: string) => {
     const data = await apiRequest<Trace>(`/invoices/${id}/traceability`); setTrace(data);
+    setDeliveryId(data.deliveries.at(-1)?.id ?? "");
     setDrafts(data.lines.filter((line) => line.returnable > 0).map((line) => ({ sku: line.sku, quantity: 0, disposition: "available_warehouse", notes: "" })));
     return data;
   };
@@ -52,7 +55,7 @@ export function PostSaleCenter() {
   useEffect(() => {
     if (!selectedId) return;
     let active = true;
-    apiRequest<Trace>(`/invoices/${selectedId}/traceability`).then((data) => { if (active) { setTrace(data); setDrafts(data.lines.filter((line) => line.returnable > 0).map((line) => ({ sku: line.sku, quantity: 0, disposition: "available_warehouse", notes: "" }))); } })
+    apiRequest<Trace>(`/invoices/${selectedId}/traceability`).then((data) => { if (active) { setTrace(data); setDeliveryId(data.deliveries.at(-1)?.id ?? ""); setDrafts(data.lines.filter((line) => line.returnable > 0).map((line) => ({ sku: line.sku, quantity: 0, disposition: "available_warehouse", notes: "" }))); } })
       .catch((caught) => { if (active) setError(caught instanceof Error ? caught.message : "No pudimos cargar la trazabilidad."); });
     return () => { active = false; };
   }, [selectedId]);
@@ -65,7 +68,7 @@ export function PostSaleCenter() {
     if (!selectedId) return;
     setSaving(true); setError(null); setSuccess(null);
     try {
-      await apiRequest("/returns", { method: "POST", body: JSON.stringify({ invoice_id: selectedId, reason: returnReason, lines: drafts.filter((line) => line.quantity > 0) }) });
+      await apiRequest("/returns", { method: "POST", body: JSON.stringify({ invoice_id: selectedId, delivery_id: deliveryId || null, reason: returnReason, lines: drafts.filter((line) => line.quantity > 0) }) });
       await loadTrace(selectedId); setReturnReason(""); setSuccess("Devolución registrada; el inventario y sus bloqueos fueron actualizados.");
     } catch (caught) { setError(caught instanceof Error ? caught.message : "No pudimos registrar la devolución."); }
     finally { setSaving(false); }
@@ -91,6 +94,7 @@ export function PostSaleCenter() {
     {selected && trace && <><section className="post-sale-summary"><div><span>Factura</span><strong>{trace.invoice.number}</strong></div><div><span>Cliente</span><strong>{trace.invoice.customer}</strong></div><div><span>Valor original</span><strong>{money(trace.invoice.total_value)}</strong></div><div><span>Valor neto</span><strong>{money(trace.invoice.net_value)}</strong></div></section>
       <div className="post-sale-grid">
         <section className="post-sale-panel"><h2>Registrar devolución física</h2><p>Solo puedes devolver unidades previamente despachadas.</p>
+          {trace.deliveries.length > 0 && <label className="full-field"><span>Entrega relacionada</span><select value={deliveryId} onChange={(event) => setDeliveryId(event.target.value)}><option value="">Sin entrega específica</option>{trace.deliveries.map((delivery) => <option key={delivery.id} value={delivery.id}>{dateLabel(delivery.delivered_at)} · {delivery.recipient ?? "Sin receptor"}</option>)}</select></label>}
           <div className="return-lines">{drafts.map((draft, index) => { const source = trace.lines.find((line) => line.sku === draft.sku)!; return <article className={draft.quantity > 0 && !["available_warehouse", "available_floor"].includes(draft.disposition) ? "has-difference" : ""} key={draft.sku}><header><ProductIdentity name={source.product_name} sku={draft.sku} /><small>Máximo: {source.returnable}</small></header><div><label><span>Cantidad</span><input type="number" min={0} max={source.returnable} value={draft.quantity} onChange={(event) => updateDraft(index, { quantity: Number(event.target.value) })} /></label><label><span>Destino del producto</span><select value={draft.disposition} onChange={(event) => updateDraft(index, { disposition: event.target.value })}>{Object.entries(dispositions).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label></div>{draft.quantity > 0 && !["available_warehouse", "available_floor"].includes(draft.disposition) && <label><span>Detalle de revisión o daño</span><input value={draft.notes} onChange={(event) => updateDraft(index, { notes: event.target.value })} placeholder="Abrirá una incidencia" /></label>}</article>; })}</div>
           {drafts.length === 0 && <div className="table-message">No quedan unidades susceptibles de devolución.</div>}
           <label className="full-field"><span>Motivo general *</span><textarea rows={3} minLength={5} value={returnReason} onChange={(event) => setReturnReason(event.target.value)} /></label>

@@ -1,3 +1,6 @@
+import os
+from datetime import datetime, timezone
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -9,6 +12,7 @@ from app.core.config import get_settings
 
 
 settings = get_settings()
+PROCESS_STARTED_AT = datetime.now(timezone.utc).isoformat()
 
 
 def create_app() -> FastAPI:
@@ -46,7 +50,13 @@ def create_app() -> FastAPI:
 
     @application.get("/health", tags=["Sistema"])
     def health() -> dict[str, str]:
-        return {"status": "ok", "service": "inventario-operativo-api"}
+        return {
+            "status": "ok",
+            "service": "inventario-operativo-api",
+            "version": os.getenv("RENDER_GIT_COMMIT", "local")[:12],
+            "deployed_at": PROCESS_STARTED_AT,
+            "environment": settings.environment,
+        }
 
     return application
 

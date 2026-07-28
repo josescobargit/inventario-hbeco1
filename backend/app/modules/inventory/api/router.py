@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -29,11 +29,15 @@ MOVEMENT_LABELS = {
     "reservation_released": "Reserva liberada",
     "invoice_registered": "Factura registrada",
     "invoice_edited": "Factura corregida",
+    "invoice_cancelled": "Factura anulada",
     "dispatch_confirmed": "Despacho confirmado",
     "incident_resolved": "Incidencia resuelta",
     "customer_return": "Devolución",
     "general_entry": "Entrada general",
     "general_exit": "Salida general",
+    "supplier_invoice_registered": "Factura de proveedor registrada",
+    "supplier_invoice_edited": "Factura de proveedor corregida",
+    "supplier_invoice_cancelled": "Factura de proveedor anulada",
 }
 
 TRACKED_FIELDS = (
@@ -73,8 +77,10 @@ def serialize_movement(
         "category": product.category,
         "affected_field": affected_field,
         "delta": delta,
+        "quantity": movement.quantity,
         "reference_type": movement.reference_type,
         "reference_id": movement.reference_id,
+        "purchase_order_id": movement.purchase_order_id,
         "reason": movement.reason,
         "actor": user.full_name if user else "Usuario no disponible",
         "before_value": movement.before_value,
@@ -100,18 +106,42 @@ def list_availability(
     db: Annotated[Session, Depends(get_db)],
     search: Annotated[str | None, Query(max_length=100)] = None,
     category: Annotated[str | None, Query(max_length=100)] = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 25,
 ) -> list[AvailabilityResponse]:
     statement = (
         select(Product, InventoryPositionModel)
         .join(InventoryPositionModel, InventoryPositionModel.product_id == Product.id)
         .join(Warehouse, Warehouse.id == InventoryPositionModel.warehouse_id)
         .where(Product.is_active.is_(True), Warehouse.code == "principal")
-        .order_by(Product.sku)
+        .order_by(Product.name, Product.sku)
+        .limit(limit)
     )
     if search and search.strip():
-        term = f"%{search.strip()}%"
+        normalized_fields = []
+        for field in (
+            Product.sku,
+            Product.name,
+            Product.barcode,
+            Product.contifico_aux_code,
+            Product.description,
+        ):
+            expression = func.lower(func.coalesce(field, ""))
+            for accented, plain in zip("áéíóúüñ", "aeiouun", strict=True):
+                expression = func.replace(expression, accented, plain)
+            normalized_fields.append(expression)
+        terms = (
+            search.strip()
+            .lower()
+            .translate(str.maketrans("áéíóúüñ", "aeiouun"))
+            .split()
+        )
         statement = statement.where(
-            or_(Product.sku.ilike(term), Product.name.ilike(term))
+            and_(
+                *[
+                    or_(*[field.like(f"%{term}%") for field in normalized_fields])
+                    for term in terms
+                ]
+            )
         )
     if category and category.strip():
         statement = statement.where(Product.category == category.strip())

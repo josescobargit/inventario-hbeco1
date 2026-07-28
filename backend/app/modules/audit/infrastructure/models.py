@@ -2,12 +2,14 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, ForeignKey, String, Text, Uuid
+from sqlalchemy import JSON, DateTime, ForeignKey, String, Text, Uuid
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
 from app.core.time import utc_now
+
+json_type = JSON().with_variant(JSONB, "postgresql")
 
 
 class AuditLog(Base):
@@ -21,8 +23,10 @@ class AuditLog(Base):
     entity_type: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
     entity_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
-    previous_value: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
-    new_value: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    previous_value: Mapped[dict[str, Any] | None] = mapped_column(
+        json_type, nullable=True
+    )
+    new_value: Mapped[dict[str, Any] | None] = mapped_column(json_type, nullable=True)
     ip_address: Mapped[str | None] = mapped_column(String(64), nullable=True)
     user_agent: Mapped[str | None] = mapped_column(String(512), nullable=True)
     occurred_at: Mapped[datetime] = mapped_column(

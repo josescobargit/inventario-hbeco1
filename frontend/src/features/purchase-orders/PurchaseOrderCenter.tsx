@@ -6,6 +6,7 @@ import {
 } from "../invoices/quickEntry";
 import { ProductIdentity } from "../inventory/ProductIdentity";
 import { PurchaseOrderDocumentImport } from "./PurchaseOrderDocumentImport";
+import { PurchaseOrderCombobox } from "./PurchaseOrderCombobox";
 import { DocumentViewer, ViewableDocument } from "./DocumentViewer";
 
 interface ProductOption {
@@ -51,7 +52,7 @@ interface PurchaseOrder {
   status: string;
   notes: string | null;
   lines: OrderLine[];
-  source_documents: Array<ViewableDocument & { extraction_method: string }>;
+  source_documents: Array<ViewableDocument & { extraction_method: string; available?: boolean }>;
   related_invoices: Array<{
     id: string; invoice_number: string; administrative_status: string;
     dispatch_status: string; delivery_status: string;
@@ -61,7 +62,9 @@ interface PurchaseOrder {
   related_reservations: Array<{ id: string; status: string; reason: string }>;
   has_related_operations: boolean;
   manually_modified: boolean;
+  product_count: number;
 }
+interface PurchaseOrderPage { items: Array<Pick<PurchaseOrder, "id" | "chain_name" | "order_number" | "order_date" | "destination" | "status" | "product_count">>; next_cursor: string | null }
 
 interface DraftLine {
   id: number; sku: string; quantity: string; units_per_box?: number | null;
@@ -90,32 +93,47 @@ const fulfillmentLabels: Record<string, string> = {
   delivered_excess: "Entregado con exceso", with_return: "Con devolución",
   with_incident: "Con incidencia",
 };
+const summaryOrder = (order: PurchaseOrderPage["items"][number]): PurchaseOrder => ({
+  ...order, customer_name: order.chain_name, notes: null, lines: [], source_documents: [],
+  related_invoices: [], related_reservations: [], has_related_operations: false,
+  manually_modified: false,
+});
 
-function ProductSearch({ products, value, disabledSkus, onChange, label }: {
+function ProductSearch({ products, value, disabledSkus, onChange, onProductLoaded, label }: {
   products: ProductOption[]; value: string; disabledSkus: Set<string>;
-  onChange: (sku: string) => boolean | void; label: string;
+  onChange: (sku: string) => boolean | void; onProductLoaded: (product: ProductOption) => void; label: string;
 }) {
   const selected = products.find((item) => item.sku === value);
   const [query, setQuery] = useState(selected ? `${selected.product_name} · SKU: ${selected.sku}` : "");
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(0);
-  const matches = useMemo(() => {
-    const terms = normalize(query).trim().split(/\s+/).filter(Boolean);
-    return products.map((item) => {
-      if (disabledSkus.has(item.sku) && item.sku !== value) return null;
-      const sku = normalize(item.sku);
-      const name = normalize(item.product_name);
-      const text = `${sku} ${name} ${normalize(item.barcode ?? "")} ${normalize(item.contifico_aux_code ?? "")}`;
-      if (terms.some((term) => !text.includes(term))) return null;
-      const score = terms.reduce((sum, term) => sum + (sku === term ? 100 : sku.startsWith(term) ? 60 : name.startsWith(term) ? 35 : 10), 0);
-      return { item, score };
-    }).filter((entry): entry is { item: ProductOption; score: number } => entry !== null)
-      .sort((a, b) => b.score - a.score || a.item.sku.localeCompare(b.item.sku))
-      .slice(0, 8).map(({ item }) => item);
-  }, [disabledSkus, products, query, value]);
+  const [matches, setMatches] = useState<ProductOption[]>([]);
+  const [searching, setSearching] = useState(false);
+  const productRequest = useRef<AbortController | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    const timer = window.setTimeout(async () => {
+      productRequest.current?.abort();
+      const controller = new AbortController();
+      productRequest.current = controller; setSearching(true);
+      try {
+        const params = new URLSearchParams({ limit: "25" });
+        if (query.trim() && !selected) params.set("search", query.trim());
+        const found = await apiRequest<ProductOption[]>(`/inventory/availability?${params}`, { signal: controller.signal });
+        setMatches(found.filter((item) => !disabledSkus.has(item.sku) || item.sku === value));
+        setActive(0);
+      } catch (caught) {
+        if (!(caught instanceof DOMException && caught.name === "AbortError")) setMatches([]);
+      } finally {
+        if (productRequest.current === controller) setSearching(false);
+      }
+    }, 180);
+    return () => { window.clearTimeout(timer); productRequest.current?.abort(); };
+  }, [disabledSkus, open, query, selected, value]);
   const choose = (sku: string) => {
-    const product = products.find((item) => item.sku === sku);
+    const product = matches.find((item) => item.sku === sku) ?? products.find((item) => item.sku === sku);
     if (onChange(sku) === false) { setOpen(false); return; }
+    if (product) onProductLoaded(product);
     setQuery(product ? `${product.product_name} · SKU: ${product.sku}` : "");
     setOpen(false); setActive(0);
   };
@@ -127,19 +145,29 @@ function ProductSearch({ products, value, disabledSkus, onChange, label }: {
   };
   return <label className="product-combobox"><span>{label}</span><div className="combobox">
     <input required role="combobox" aria-label={label} aria-autocomplete="list" aria-expanded={open} aria-controls="product-options"
-      autoComplete="off" value={query} placeholder="Busca por nombre, SKU, variante o tamaño"
-      onFocus={() => { setOpen(true); setActive(0); }}
+      autoComplete="off" value={value && selected ? `${selected.product_name} · SKU: ${selected.sku}` : query} placeholder="Busca por nombre, SKU, variante o tamaño"
+      onFocus={() => { if (value && selected) setQuery(`${selected.product_name} · SKU: ${selected.sku}`); setOpen(true); setActive(0); }}
       onBlur={() => window.setTimeout(() => setOpen(false), 120)}
       onKeyDown={onKeyDown}
-      onChange={(event) => { setQuery(event.target.value); onChange(""); setOpen(true); setActive(0); }} />
+      onChange={(event) => {
+        const nextQuery = event.target.value;
+        setQuery(nextQuery); onChange(""); setOpen(true); setActive(0);
+        const terms = normalize(nextQuery).trim().split(/\s+/).filter(Boolean);
+        setMatches(products.filter((item) => {
+          if (disabledSkus.has(item.sku)) return false;
+          const text = normalize(`${item.product_name} ${item.sku} ${item.barcode ?? ""} ${item.contifico_aux_code ?? ""}`);
+          return terms.every((term) => text.includes(term));
+        }).slice(0, 25));
+      }} />
     {value && <button className="combobox-clear" type="button" aria-label="Limpiar producto"
       onMouseDown={(event) => event.preventDefault()} onClick={() => { if (onChange("") === false) return; setQuery(""); setOpen(true); }}>×</button>}
     {open && <div className="combobox-options product-options" id="product-options" role="listbox">
+      {searching && <span>Buscando…</span>}
       {matches.map((item, index) => <button key={item.id} type="button" role="option" aria-selected={index === active}
         onMouseDown={(event) => event.preventDefault()} onMouseEnter={() => setActive(index)} onClick={() => choose(item.sku)}>
         <strong>{item.product_name}</strong><span>SKU: {item.sku}</span>
       </button>)}
-      {!matches.length && <span>No hay coincidencias en el catálogo.</span>}
+      {!searching && !matches.length && <span>No hay coincidencias en el catálogo.</span>}
     </div>}
   </div></label>;
 }
@@ -168,6 +196,11 @@ export function PurchaseOrderCenter() {
   const [notes, setNotes] = useState("");
   const [lines, setLines] = useState<DraftLine[]>([emptyLine()]);
   const [loading, setLoading] = useState(true);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [orderSearch, setOrderSearch] = useState("");
+  const [orderStatus, setOrderStatus] = useState("");
+  const [pageSize, setPageSize] = useState(25);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
@@ -185,40 +218,86 @@ export function PurchaseOrderCenter() {
   const submitLock = useRef(false);
   const successTimerRef = useRef<number | null>(null);
 
+  const normalizeDetail = (order: PurchaseOrder): PurchaseOrder => ({
+    ...order, product_count: order.lines.length,
+    source_documents: order.source_documents ?? [], related_invoices: order.related_invoices ?? [],
+    related_reservations: order.related_reservations ?? [],
+    has_related_operations: order.has_related_operations ?? Boolean(order.related_invoices?.length),
+    manually_modified: order.manually_modified ?? false,
+    lines: order.lines.map((line) => ({
+      ...line, invoiced_quantity: line.invoiced_quantity ?? 0,
+      dispatched_quantity: line.dispatched_quantity ?? 0, delivered_quantity: line.delivered_quantity ?? 0,
+      returned_quantity: line.returned_quantity ?? 0, net_delivered_quantity: line.net_delivered_quantity ?? 0,
+      pending_delivery: line.pending_delivery ?? line.ordered_quantity,
+      difference: line.difference ?? -line.ordered_quantity,
+      fulfillment_status: line.fulfillment_status ?? "not_processed", has_incident: line.has_incident ?? false,
+    })),
+  });
+  const loadOrderPage = async (append = false, cursor: string | null = null) => {
+    setLoading(true);
+    try {
+      const params = new URLSearchParams();
+      if (pageSize !== 25) params.set("limit", String(pageSize));
+      if (orderSearch.trim()) params.set("search", orderSearch.trim());
+      if (orderStatus) params.set("status", orderStatus);
+      if (cursor) params.set("cursor", cursor);
+      const suffix = params.size ? `?${params}` : "";
+      const response = await apiRequest<PurchaseOrderPage | PurchaseOrder[]>(`/purchase-orders${suffix}`);
+      const page: PurchaseOrderPage = Array.isArray(response)
+        ? { items: response.map((order) => ({ ...order, product_count: order.lines.length })), next_cursor: null }
+        : response;
+      const summaries = page.items.map((item) => {
+        const full = Array.isArray(response) ? response.find((order) => order.id === item.id) : null;
+        return full ? normalizeDetail(full) : summaryOrder(item);
+      });
+      setOrders((current) => append ? [...current, ...summaries] : summaries);
+      setNextCursor(page.next_cursor);
+      if (!append) setSelectedId(null);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "No pudimos cargar las órdenes de compra.");
+    } finally { setLoading(false); }
+  };
+  const loadOrderDetail = async (id: string): Promise<PurchaseOrder | null> => {
+    const existing = orders.find((order) => order.id === id);
+    if (existing?.lines.length) return existing;
+    setDetailLoading(true);
+    try {
+      const detail = normalizeDetail(await apiRequest<PurchaseOrder>(`/purchase-orders/${id}`));
+      setOrders((current) => current.map((order) => order.id === id ? detail : order));
+      return detail;
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "No pudimos cargar el detalle de la OC.");
+      return null;
+    } finally { setDetailLoading(false); }
+  };
+  const ensureProducts = async () => {
+    if (products.length) return;
+    setProducts(await apiRequest<ProductOption[]>("/inventory/availability?limit=100"));
+  };
+  const cacheOrderProducts = (order: PurchaseOrder) => setProducts((current) => {
+    const bySku = new Map(current.map((product) => [product.sku, product]));
+    for (const line of order.lines) {
+      if (!bySku.has(line.sku)) bySku.set(line.sku, {
+        id: line.sku, sku: line.sku, product_name: line.product_name,
+        barcode: null, contifico_aux_code: null,
+        available_to_invoice: line.available, units_per_box: line.units_per_box ?? 1,
+      });
+    }
+    return [...bySku.values()];
+  });
+
   useEffect(() => {
-    Promise.all([
-      apiRequest<PurchaseOrder[]>("/purchase-orders"),
-      apiRequest<ProductOption[]>("/inventory/availability"),
-      apiRequest<OperationalSettings>("/settings/operational"),
-    ])
-      .then(([loadedOrders, loadedProducts, loadedSettings]) => {
-        setOrders(loadedOrders.map((order) => ({
-          ...order,
-          source_documents: order.source_documents ?? [],
-          related_invoices: order.related_invoices ?? [],
-          related_reservations: order.related_reservations ?? [],
-          has_related_operations: order.has_related_operations ?? Boolean(order.related_invoices?.length),
-          manually_modified: order.manually_modified ?? false,
-          lines: order.lines.map((line) => ({
-            ...line,
-            invoiced_quantity: line.invoiced_quantity ?? 0,
-            dispatched_quantity: line.dispatched_quantity ?? 0,
-            delivered_quantity: line.delivered_quantity ?? 0,
-            returned_quantity: line.returned_quantity ?? 0,
-            net_delivered_quantity: line.net_delivered_quantity ?? 0,
-            pending_delivery: line.pending_delivery ?? line.ordered_quantity,
-            difference: line.difference ?? -line.ordered_quantity,
-            fulfillment_status: line.fulfillment_status ?? "not_processed",
-            has_incident: line.has_incident ?? false,
-          })),
-        })));
-        setProducts(loadedProducts);
-        setSuggestedChains(loadedSettings.suggested_chains);
-        setSelectedId(loadedOrders[0]?.id ?? null);
-      })
+    apiRequest<OperationalSettings>("/settings/operational")
+      .then((loadedSettings) => setSuggestedChains(loadedSettings.suggested_chains))
       .catch((caught) => setError(caught instanceof Error ? caught.message : "No pudimos cargar las órdenes de compra."))
-      .finally(() => setLoading(false));
+      .finally(() => undefined);
   }, []);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => { void loadOrderPage(); }, 220);
+    return () => window.clearTimeout(timer);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [orderSearch, orderStatus, pageSize]);
 
   useEffect(() => {
     if (successTimerRef.current !== null) window.clearTimeout(successTimerRef.current);
@@ -232,7 +311,10 @@ export function PurchaseOrderCenter() {
     };
   }, [success]);
 
-  const selected = useMemo(() => orders.find((order) => order.id === selectedId) ?? null, [orders, selectedId]);
+  const selected = useMemo(() => {
+    const order = orders.find((item) => item.id === selectedId);
+    return order?.lines.length ? order : null;
+  }, [orders, selectedId]);
   const editingOrder = useMemo(
     () => orders.find((order) => order.id === editingOrderId) ?? null,
     [editingOrderId, orders],
@@ -312,23 +394,32 @@ export function PurchaseOrderCenter() {
     setConfirmedPreview(false); setTemplateConfirmed(false); setCopyOrderId(""); setQuickMode(false); setError(null);
     setEditingOrderId(null); setEditReview(false); setEditReason("");
   };
-  const applyOrderTemplate = (order: PurchaseOrder) => {
+  const applyOrderTemplate = async (order: PurchaseOrder) => {
+    const fullOrder = order.lines.length ? order : await loadOrderDetail(order.id);
+    if (!fullOrder) return;
+    cacheOrderProducts(fullOrder);
+    void ensureProducts();
     setShowDocumentImport(false); setShowForm(true); setQuickMode(false); setSuccess(null);
     setEditingOrderId(null); setEditReview(false); setEditReason("");
-    setChainName(order.chain_name); setSelectedChain(order.chain_name); setDestination(order.destination ?? "");
+    setChainName(fullOrder.chain_name); setSelectedChain(fullOrder.chain_name); setDestination(fullOrder.destination ?? "");
     setOrderNumber(""); setOrderDate(""); setNotes("");
-    setLines(order.lines.map((line) => ({ id: nextDraftLineId++, sku: line.sku, quantity: String(line.ordered_quantity), units_per_box: line.units_per_box })));
-    setCopyOrderId(order.id); setTemplateConfirmed(false);
+    setLines(fullOrder.lines.map((line) => ({ id: nextDraftLineId++, sku: line.sku, quantity: String(line.ordered_quantity), units_per_box: line.units_per_box })));
+    setCopyOrderId(fullOrder.id); setTemplateConfirmed(false);
     window.setTimeout(() => orderNumberRef.current?.focus(), 0);
   };
-  const startEdit = (order: PurchaseOrder) => {
+  const startEdit = async (order: PurchaseOrder) => {
+    const fullOrder = order.lines.length ? order : await loadOrderDetail(order.id);
+    if (!fullOrder) return;
+    cacheOrderProducts(fullOrder);
+    void ensureProducts();
+    setSelectedId(fullOrder.id);
     setShowDocumentImport(false); setShowForm(true); setQuickMode(false);
-    setEditingOrderId(order.id); setEditReview(false); setEditReason("");
+    setEditingOrderId(fullOrder.id); setEditReview(false); setEditReason("");
     setError(null); setSuccess(null);
-    setChainName(order.chain_name); setSelectedChain(order.chain_name);
-    setOrderNumber(order.order_number); setOrderDate(order.order_date ?? "");
-    setDestination(order.destination ?? ""); setNotes(order.notes ?? "");
-    setLines(order.lines.map((line) => ({
+    setChainName(fullOrder.chain_name); setSelectedChain(fullOrder.chain_name);
+    setOrderNumber(fullOrder.order_number); setOrderDate(fullOrder.order_date ?? "");
+    setDestination(fullOrder.destination ?? ""); setNotes(fullOrder.notes ?? "");
+    setLines(fullOrder.lines.map((line) => ({
       id: nextDraftLineId++,
       sku: line.sku,
       original_sku: line.sku,
@@ -385,7 +476,8 @@ export function PurchaseOrderCenter() {
     const data = new FormData(); data.append("file", file);
     try {
       const updated = await apiUpload<PurchaseOrder>(`/purchase-orders/${order.id}/documents`, data);
-      setOrders((current) => current.map((item) => item.id === updated.id ? updated : item));
+      const normalized = normalizeDetail(updated);
+      setOrders((current) => current.map((item) => item.id === normalized.id ? normalized : item));
       setSelectedDocumentToken(updated.source_documents.at(-1)?.token ?? null);
       setSuccess("Documento corregido adjuntado");
     } catch (caught) {
@@ -432,7 +524,8 @@ export function PurchaseOrderCenter() {
           lines: lines.map(({ sku, quantity, units_per_box }) => ({ sku, quantity: Number(quantity), units_per_box })),
         }),
       });
-      setOrders((current) => [created, ...current]);
+      const normalized = normalizeDetail(created);
+      setOrders((current) => [normalized, ...current]);
       setSuccess("OC registrada correctamente");
       resetForm(keepChainDestination);
       window.setTimeout(() => orderNumberRef.current?.focus(), 0);
@@ -472,8 +565,9 @@ export function PurchaseOrderCenter() {
           })),
         }),
       });
-      setOrders((current) => current.map((item) => item.id === updated.id ? updated : item));
-      setSelectedId(updated.id); setShowForm(false); setEditingOrderId(null);
+      const normalized = normalizeDetail(updated);
+      setOrders((current) => current.map((item) => item.id === normalized.id ? normalized : item));
+      setSelectedId(normalized.id); setShowForm(false); setEditingOrderId(null);
       setEditReview(false); setEditReason(""); setSuccess("OC actualizada correctamente");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "No pudimos actualizar la OC.");
@@ -496,14 +590,14 @@ export function PurchaseOrderCenter() {
     <main className="dashboard order-center">
       <section className="module-heading">
         <div className="welcome-block"><p className="eyebrow">Documento de origen</p><h1>Órdenes de Compra</h1><p>Registra el pedido original de cada cadena y contrástalo con el inventario realmente disponible.</p></div>
-        <div className="heading-actions">{!showDocumentImport && !editingOrderId && <button className="secondary-button" type="button" onClick={() => { setShowDocumentImport(true); setShowForm(false); setError(null); setSuccess(null); }}>Leer PDF o imagen</button>}{!showDocumentImport && <button className="primary-button" type="button" onClick={() => { if (editingOrderId) cancelEdit(); else { setShowForm((value) => !value); setError(null); setSuccess(null); } }}>{showForm ? editingOrderId ? "Cancelar edición" : "Cancelar" : "Nueva OC"}</button>}</div>
+        <div className="heading-actions">{!showDocumentImport && !editingOrderId && <button className="secondary-button" type="button" onClick={() => { void ensureProducts(); setShowDocumentImport(true); setShowForm(false); setError(null); setSuccess(null); }}>Leer PDF o imagen</button>}{!showDocumentImport && <button className="primary-button" type="button" onClick={() => { if (editingOrderId) cancelEdit(); else { if (!showForm) void ensureProducts(); setShowForm((value) => !value); setError(null); setSuccess(null); } }}>{showForm ? editingOrderId ? "Cancelar edición" : "Cancelar" : "Nueva OC"}</button>}</div>
       </section>
 
       {error && <div className="message error" role="alert">{error}</div>}
       {success && <div className="message success po-toast" role="status"><span>{success}</span><button type="button" aria-label="Cerrar notificación" onClick={() => setSuccess(null)}>×</button></div>}
 
       {showDocumentImport && <PurchaseOrderDocumentImport products={products} orders={orders} onCreated={(created) => {
-        setOrders((current) => [created as PurchaseOrder, ...current]);
+        setOrders((current) => [normalizeDetail(created as PurchaseOrder), ...current]);
         setShowDocumentImport(false); setShowForm(true); setSuccess("OC registrada correctamente");
         resetForm(keepChainDestination);
         window.setTimeout(() => orderNumberRef.current?.focus(), 0);
@@ -521,7 +615,7 @@ export function PurchaseOrderCenter() {
           <label><span>Fecha de OC</span><input type="date" value={orderDate} onChange={(event) => { setOrderDate(event.target.value); setEditReview(false); }} /></label>
           <label className="wide"><span>Destino</span><input value={destination} onChange={(event) => { setDestination(event.target.value); setEditReview(false); }} placeholder="CD o lugar de entrega" /></label>
         </div>
-        {!quickMode && !editingOrder && <label className="copy-order-field"><span>Copiar productos de otra OC</span><select value={copyOrderId} onChange={(event) => { const order = orders.find((item) => item.id === event.target.value); if (order) applyOrderTemplate(order); else { setCopyOrderId(""); setTemplateConfirmed(false); } }}><option value="">No copiar</option>{orders.map((order) => <option key={order.id} value={order.id}>{order.chain_name} · {order.order_number}</option>)}</select></label>}
+        {!quickMode && !editingOrder && <div className="copy-order-field"><PurchaseOrderCombobox label="Copiar productos de otra OC" value={orders.find((item) => item.id === copyOrderId) ?? null} onSelect={async (summary) => { if (!summary) { setCopyOrderId(""); setTemplateConfirmed(false); return; } const order = await loadOrderDetail(summary.id); if (order) await applyOrderTemplate(order); }} /></div>}
         {quickMode && <section className="quick-paste-panel"><label><span>Pega productos y cantidades</span><textarea rows={7} value={quickText} onChange={(event) => { setQuickText(event.target.value); setQuickProcessed(false); setConfirmedPreview(false); }} placeholder={"372 | AR004\n300 | SHAMPOO REGENEXT ARGAN 400 ML"} /><small>Formato admitido: cantidad | código o nombre del producto. Una línea por producto.</small></label><button className="secondary-button" type="button" onClick={() => { const parsed = parseProductLines(quickText, products); setLines(parsed.map((line) => ({ id: nextDraftLineId++, sku: line.sku, quantity: String(line.quantity ?? ""), raw: line.raw, error: line.error, suggestions: line.suggestions }))); setQuickProcessed(true); setConfirmedPreview(false); }}>Pegar y procesar</button></section>}
         <div className="order-lines"><div className="line-heading"><div><h3>{quickMode ? "Vista previa de productos" : "Productos solicitados"}</h3>{quickMode && <p>Corrige en la tabla cualquier coincidencia no reconocida.</p>}</div>{quickMode ? <button className="text-button" type="button" onClick={retryRecognition}>Reintentar reconocimiento</button> : <button className="text-button" type="button" onClick={() => setLines((current) => [...current, emptyLine()])}>+ Agregar producto</button>}</div>
           {quickMode && !quickProcessed && <div className="table-message">Pega la lista y pulsa “Pegar y procesar” para generar la vista previa.</div>}
@@ -534,7 +628,7 @@ export function PurchaseOrderCenter() {
               || originalLine.delivered_quantity > 0
             ));
             return <div className={`draft-line ${editingOrder ? "editing-line" : ""} ${quickMode && !line.sku ? "unrecognized-line" : ""}`} key={line.id}>
-              <ProductSearch products={products} value={line.sku} disabledSkus={selectedSkus} label={quickMode ? line.raw || "Producto" : "Producto"} onChange={(sku) => {
+              <ProductSearch products={products} value={line.sku} disabledSkus={selectedSkus} label={quickMode ? line.raw || "Producto" : "Producto"} onProductLoaded={(loaded) => setProducts((current) => current.some((item) => item.sku === loaded.sku) ? current : [...current, loaded])} onChange={(sku) => {
                 if (editingOrder && lineHasOperations && sku !== line.original_sku) {
                   updateLine(index, { error: `No puedes cambiar ${line.original_sku} porque ya tiene operaciones relacionadas.` });
                   return false;
@@ -568,18 +662,25 @@ export function PurchaseOrderCenter() {
       {!showDocumentImport && !showForm && <section className="order-workspace">
         <aside className="order-list">
           <div className="list-title"><strong>Órdenes registradas</strong><span>{orders.length}</span></div>
+          <div className="order-list-filters">
+            <input aria-label="Buscar órdenes" value={orderSearch} onChange={(event) => setOrderSearch(event.target.value)} placeholder="Buscar número, cadena, estado o destino" />
+            <select aria-label="Filtrar por estado" value={orderStatus} onChange={(event) => setOrderStatus(event.target.value)}><option value="">Todos los estados</option><option value="open">Abiertas</option><option value="partially_invoiced">Facturadas parcialmente</option><option value="completed">Completadas</option><option value="cancelled">Canceladas</option></select>
+            <select aria-label="Órdenes por página" value={pageSize} onChange={(event) => setPageSize(Number(event.target.value))}><option value={25}>25 por página</option><option value={50}>50 por página</option></select>
+          </div>
           {loading && <div className="table-message">Cargando órdenes…</div>}
-          {!loading && orders.map((order) => <div className="order-list-entry" key={order.id}><button type="button" className={`order-list-item ${selectedId === order.id ? "selected" : ""}`} onClick={() => { setSelectedId(order.id); setSelectedDocumentToken(order.source_documents[0]?.token ?? null); setDetailPane("comparison"); setShowHistory(false); }}><strong>{order.order_number}</strong><span>{order.chain_name}</span><small>{order.lines.length} producto{order.lines.length === 1 ? "" : "s"}</small></button><div className="order-list-actions"><button className="template-link" type="button" onClick={() => startEdit(order)}>Editar OC</button><button className="template-link" type="button" onClick={() => applyOrderTemplate(order)}>Usar como plantilla</button></div></div>)}
+          {!loading && orders.map((order) => <div className="order-list-entry" key={order.id}><button type="button" className={`order-list-item ${selectedId === order.id ? "selected" : ""}`} onClick={async () => { setSelectedId(order.id); setDetailPane("comparison"); setShowHistory(false); const detail = await loadOrderDetail(order.id); setSelectedDocumentToken(detail?.source_documents[0]?.token ?? null); }}><strong>{order.order_number}</strong><span>{order.chain_name}</span><small>{order.product_count} producto{order.product_count === 1 ? "" : "s"}</small></button><div className="order-list-actions"><button className="template-link" type="button" onClick={() => void startEdit(order)}>Editar OC</button><button className="template-link" type="button" onClick={() => void applyOrderTemplate(order)}>Usar como plantilla</button></div></div>)}
+          {!loading && nextCursor && <button className="secondary-button load-more-orders" type="button" onClick={() => void loadOrderPage(true, nextCursor)}>Cargar más</button>}
           {!loading && orders.length === 0 && <div className="table-message">Todavía no hay órdenes. Registra la primera para comenzar el flujo.</div>}
         </aside>
         <div className="order-detail">
+          {detailLoading && <div className="table-message">Cargando detalle de la OC…</div>}
           {!selected && !loading && <div className="empty-detail"><strong>La OC inicia la trazabilidad</strong><span>Luego podrás reservar stock y vincular la factura correcta.</span></div>}
           {selected && <><header className="detail-header"><div><p className="eyebrow">{selected.chain_name}</p><h2>OC {selected.order_number}</h2><p>{selected.destination ?? "Sin destino especificado"}</p></div><div className="detail-actions"><span className="status-pill available">{selected.status === "open" ? "Abierta" : selected.status === "partially_invoiced" ? "Facturada parcialmente" : selected.status === "completed" ? "Completamente facturada" : "Cancelada"}</span><button className="secondary-button" type="button" onClick={() => startEdit(selected)}>Editar OC</button><button className="secondary-button" type="button" onClick={() => loadHistory(selected)}>Historial de cambios</button><button className="secondary-button" type="button" onClick={() => applyOrderTemplate(selected)}>Usar como plantilla</button><button className="primary-button" type="button" disabled={!selected.lines.some((line) => line.suggested_to_invoice > 0)} onClick={() => prepareInvoice(selected)}>Preparar factura</button></div></header>
             {selected.manually_modified && <div className="message warning">Esta OC contiene modificaciones manuales posteriores al documento original.</div>}
             <div className="mobile-detail-tabs" role="group" aria-label="Vista de la orden"><button type="button" className={detailPane === "document" ? "active" : ""} onClick={() => setDetailPane("document")}>Documento original</button><button type="button" className={detailPane === "data" ? "active" : ""} onClick={() => setDetailPane("data")}>Datos reconocidos</button><button type="button" className={detailPane === "comparison" ? "active" : ""} onClick={() => setDetailPane("comparison")}>Comparación</button></div>
             <section className={`trace-section detail-data-pane mobile-pane-${detailPane}`}><div className="line-heading"><h3>Disponibilidad y facturación</h3><div className="billing-filters" role="group" aria-label="Filtrar disponibilidad">{([["all", "Todos"], ["billable", "Facturables"], ["shortage", "Con faltantes"], ["no_stock", "Sin inventario"], ["review", "Pendientes de revisión"]] as const).map(([value, label]) => <button type="button" className={billingFilter === value ? "active" : ""} key={value} onClick={() => setBillingFilter(value)}>{label}</button>)}</div></div><div className="table-scroll"><table><thead><tr><th>Producto</th><th>Pedido</th><th>Ya facturado</th><th>Pendiente</th><th>Disponible</th><th>Sugerido a facturar</th><th>Faltante</th><th>Resultado</th></tr></thead><tbody>{billingLines.map((line) => <tr key={line.sku} className={line.complete ? "" : "row-warning"}><td><ProductIdentity name={line.product_name} sku={line.sku} /></td><td>{line.ordered_quantity}</td><td>{line.invoiced_quantity}</td><td>{Math.max(line.ordered_quantity - line.invoiced_quantity, 0)}</td><td>{line.available}</td><td><strong>{line.suggested_to_invoice}</strong></td><td>{line.shortage}</td><td><span className={`status-pill ${line.complete ? "available" : "low_stock"}`}>{line.billing_result ?? (line.complete ? "Lista para facturar completa" : "Con faltante")}</span></td></tr>)}</tbody></table>{billingLines.length === 0 && <div className="table-message">No hay productos en este filtro.</div>}</div></section>
             <section className="po-document-comparison">
-              <aside className={`po-original-panel mobile-pane-${detailPane}`}><h3>Documento original de la orden de compra</h3>{selected.source_documents.length > 1 && <div className="document-selector">{selected.source_documents.map((document) => <button type="button" className={selectedDocument?.token === document.token ? "active" : ""} key={document.token} onClick={() => setSelectedDocumentToken(document.token)}>{document.filename}</button>)}</div>}{selectedDocument ? <DocumentViewer document={selectedDocument} url={apiUrl(`/purchase-orders/imports/${selectedDocument.token}/content`)} /> : <div className="table-message">Esta OC no fue creada desde un documento.</div>}<label className="secondary-button corrected-document-button">{attachingDocument ? "Adjuntando…" : "Adjuntar documento corregido"}<input hidden disabled={attachingDocument} type="file" accept=".pdf,.jpg,.jpeg,.png,.webp" onChange={(event) => attachCorrectedDocument(selected, event.target.files?.[0])} /></label></aside>
+              <aside className={`po-original-panel mobile-pane-${detailPane}`}><h3>Documento de origen</h3>{selected.source_documents.length > 1 && <div className="document-selector">{selected.source_documents.map((document) => <button type="button" className={selectedDocument?.token === document.token ? "active" : ""} key={document.token} onClick={() => setSelectedDocumentToken(document.token)}>{document.filename}</button>)}</div>}{selectedDocument?.available ? <DocumentViewer document={selectedDocument} url={apiUrl(`/purchase-orders/imports/${selectedDocument.token}/content`)} /> : selectedDocument ? <div className="table-message">Por privacidad y rendimiento, el archivo se eliminó después de extraer y confirmar la información. Se conserva únicamente su nombre y huella de auditoría.</div> : <div className="table-message">Esta OC no fue creada desde un documento.</div>}<label className="secondary-button corrected-document-button">{attachingDocument ? "Procesando…" : "Procesar documento corregido"}<input hidden disabled={attachingDocument} type="file" accept=".pdf,.jpg,.jpeg,.png,.webp" onChange={(event) => attachCorrectedDocument(selected, event.target.files?.[0])} /></label></aside>
               <div className={`po-comparison-panel mobile-pane-${detailPane}`}><div className="line-heading"><div><h3>Comparación: pedido vs. cumplimiento</h3><p>Las entregas se muestran en bruto; las devoluciones permanecen separadas según la regla actual.</p></div><label className="difference-filter"><input type="checkbox" checked={differenceOnly} onChange={(event) => setDifferenceOnly(event.target.checked)} /> Solo con diferencias</label></div>
                 {comparisonSummary && <div className="fulfillment-summary"><div><span>Productos</span><strong>{comparisonSummary.products}</strong></div><div><span>Unidades pedidas</span><strong>{comparisonSummary.ordered}</strong></div><div><span>Facturadas</span><strong>{comparisonSummary.invoiced}</strong></div><div><span>Despachadas</span><strong>{comparisonSummary.dispatched}</strong></div><div><span>Entregadas</span><strong>{comparisonSummary.delivered}</strong></div><div><span>Pendiente</span><strong>{comparisonSummary.pending}</strong></div><div><span>Con diferencias</span><strong>{comparisonSummary.differences}</strong></div></div>}
                 <div className="table-scroll"><table className="fulfillment-table"><thead><tr><th>Producto</th><th>Pedido</th><th>Facturado</th><th>Despachado</th><th>Entregado</th><th>Devuelto</th><th>Neto</th><th>Pendiente</th><th>Diferencia</th><th>Estado</th></tr></thead><tbody>{comparisonLines.map((line) => <tr key={line.sku} className={line.difference !== 0 || line.returned_quantity || line.has_incident ? "row-warning" : ""}><td><ProductIdentity name={line.product_name} sku={line.sku} /></td><td>{line.ordered_quantity}</td><td>{line.invoiced_quantity}</td><td>{line.dispatched_quantity}</td><td>{line.delivered_quantity}</td><td>{line.returned_quantity}</td><td>{line.net_delivered_quantity}</td><td>{line.pending_delivery}</td><td>{line.difference > 0 ? `+${line.difference}` : line.difference}</td><td><span className={`fulfillment-status ${line.fulfillment_status}`}>{fulfillmentLabels[line.fulfillment_status] ?? line.fulfillment_status}</span></td></tr>)}</tbody></table>{!comparisonLines.length && <div className="table-message">No hay productos con diferencias.</div>}</div>

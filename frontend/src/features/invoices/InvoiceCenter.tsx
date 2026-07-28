@@ -40,7 +40,10 @@ interface Traceability {
     invoiced: number;
     dispatched: number;
     missing: number;
+    delivered: number;
     pending_dispatch: number;
+    pending_confirmation: number;
+    delivery_difference: number;
     outside_purchase_order: boolean;
   }>;
   deliveries: Array<{ id: string; delivery_type: string; delivered_at: string; recipient: string | null; notes: string | null }>;
@@ -84,6 +87,7 @@ export function InvoiceCenter() {
   const [template, setTemplate] = useState<InvoiceTemplate | null>(prepared.template);
   const [editing, setEditing] = useState(false);
   const [success, setSuccess] = useState<string | null>(null);
+  const [cancelling, setCancelling] = useState(false);
 
   useEffect(() => {
     apiRequest<InvoiceSummary[]>("/invoices")
@@ -159,6 +163,27 @@ export function InvoiceCenter() {
     setShowForm(true);
   };
 
+  const cancelInvoice = async () => {
+    if (!trace || !window.confirm(`¿Anular la factura ${trace.invoice.number} y revertir su salida de inventario?`)) return;
+    setCancelling(true);
+    setError(null);
+    try {
+      const result = await apiRequest<{ inventory_affected: Array<{ sku: string; physical_confirmed: number; available_to_invoice: number }> }>(`/invoices/${trace.invoice.id}/cancel`, { method: "POST" });
+      window.dispatchEvent(new CustomEvent("inventario:inventory-changed", { detail: result.inventory_affected }));
+      const [updatedTrace, refreshed] = await Promise.all([
+        apiRequest<Traceability>(`/invoices/${trace.invoice.id}/traceability`),
+        apiRequest<InvoiceSummary[]>("/invoices"),
+      ]);
+      setTrace(updatedTrace);
+      setInvoices(refreshed);
+      setSuccess("Factura anulada e inventario restituido");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "No pudimos anular la factura.");
+    } finally {
+      setCancelling(false);
+    }
+  };
+
   return (
     <main className="dashboard invoice-center">
       <section className="module-heading">
@@ -188,13 +213,15 @@ export function InvoiceCenter() {
           {!detailLoading && trace && <>
             <header className="detail-header">
               <div><p className="eyebrow">Factura externa registrada</p><h2>{trace.invoice.number}</h2><p>{trace.invoice.customer} · {formatDate(trace.invoice.date)}</p></div>
-              <div className="value-summary"><span>Valor original <strong>{formatMoney(trace.invoice.total_value)}</strong></span><span>Valor neto <strong>{formatMoney(trace.invoice.net_value)}</strong></span><div className="detail-actions"><button className="secondary-button" type="button" onClick={() => populateFromTrace(false)}>Duplicar</button>{trace.invoice.statuses.dispatch === "pending" && trace.invoice.statuses.administrative === "confirmed" && <button className="secondary-button" type="button" onClick={() => populateFromTrace(true)}>Editar</button>}</div></div>
+              <div className="value-summary"><span>Valor original <strong>{formatMoney(trace.invoice.total_value)}</strong></span><span>Valor neto <strong>{formatMoney(trace.invoice.net_value)}</strong></span><div className="detail-actions"><button className="secondary-button" type="button" onClick={() => populateFromTrace(false)}>Duplicar</button>{trace.invoice.statuses.dispatch === "pending" && trace.invoice.statuses.administrative === "confirmed" && <><button className="secondary-button" type="button" onClick={() => populateFromTrace(true)}>Editar</button><button className="danger-button" type="button" disabled={cancelling} onClick={cancelInvoice}>{cancelling ? "Anulando…" : "Anular factura"}</button></>}</div></div>
             </header>
+            {trace.invoice.statuses.administrative === "confirmed" && trace.invoice.statuses.delivery === "pending" && <div className="message info">Facturada · Entrega pendiente</div>}
             <div className="status-grid">
               {Object.entries(trace.invoice.statuses).map(([name, status]) => <div key={name}><span>{label(name)}</span><strong>{label(status)}</strong></div>)}
             </div>
             <section className="trace-section po-summary"><span>Orden de compra vinculada</span><strong>{trace.purchase_order?.number ?? "Factura sin OC"}</strong><small>{trace.purchase_order?.chain ?? "Categoría de excepción"}</small></section>
             <section className="trace-section"><h3>Comparación OC → factura → despacho</h3><div className="table-scroll"><table><thead><tr><th>Producto</th><th>OC</th><th>Facturado</th><th>Despachado</th><th>Faltante</th><th>Pendiente</th></tr></thead><tbody>{trace.lines.map((line) => <tr className={line.outside_purchase_order ? "row-warning" : ""} key={line.sku}><td><ProductIdentity name={line.product_name} sku={line.sku} /></td><td>{line.ordered ?? "—"}</td><td>{line.invoiced}</td><td>{line.dispatched}</td><td>{line.missing}</td><td><strong>{line.pending_dispatch}</strong></td></tr>)}</tbody></table></div></section>
+            <section className="trace-section"><h3>Factura → entrega</h3><div className="table-scroll"><table><thead><tr><th>Producto</th><th>Facturado</th><th>Entregado</th><th>Pendiente de confirmar</th><th>Diferencia</th></tr></thead><tbody>{trace.lines.map((line) => <tr key={line.sku}><td><ProductIdentity name={line.product_name} sku={line.sku} /></td><td>{line.invoiced}</td><td>{line.delivered}</td><td>{line.pending_confirmation}</td><td>{line.delivery_difference > 0 ? `+${line.delivery_difference}` : line.delivery_difference}</td></tr>)}</tbody></table></div></section>
             {(trace.alerts.length > 0 || trace.incidents.length > 0) && <section className="trace-section"><h3>Novedades e incidencias</h3><div className="event-list">{trace.alerts.map((item) => <article key={item.id}><strong>{label(item.alert_type)}</strong><p>{item.description}</p><span>{item.is_resolved ? "Resuelta" : "Pendiente"}</span></article>)}{trace.incidents.map((item) => <article key={item.id}><strong>{label(item.incident_type)}</strong><p>{item.description}</p><span>{label(item.status)}{item.affected_quantity ? ` · ${item.affected_quantity} unidades` : ""}</span>{item.decision && <small>Decisión: {item.decision}</small>}</article>)}</div></section>}
             {trace.deliveries.length > 0 && <section className="trace-section"><h3>Entregas al cliente</h3><div className="event-list">{trace.deliveries.map((item) => <article key={item.id}><strong>{label(item.delivery_type)}</strong><p>{formatDate(item.delivered_at)} · {item.recipient ?? "Receptor no indicado"}</p>{item.notes && <small>{item.notes}</small>}</article>)}</div></section>}
             {(trace.returns.length > 0 || trace.adjustments.length > 0) && <section className="trace-section"><h3>Devoluciones y documentos relacionados</h3><div className="event-list">{trace.returns.map((item) => <article key={item.id}><strong>Devolución · {formatDate(item.returned_at)}</strong><p>{item.reason}</p><span>{item.lines.map((line) => `${line.sku}: ${line.quantity} (${label(line.disposition)})`).join(" · ")}</span></article>)}{trace.adjustments.map((item) => <article key={item.id}><strong>{label(item.document_type)} {item.document_number}</strong><p>{item.reason}</p><span>{formatDate(item.document_date)} · {formatMoney(item.value)}</span></article>)}</div></section>}

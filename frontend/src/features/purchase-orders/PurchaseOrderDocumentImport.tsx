@@ -7,6 +7,7 @@ import {
   PositionalTableRow,
 } from "../invoices/quickEntry";
 import { DocumentViewer } from "./DocumentViewer";
+import { ProductCombobox, SearchableProduct } from "./ProductCombobox";
 
 interface OrderSummary { id: string; chain_name: string; order_number: string }
 interface CreatedOrder extends OrderSummary { lines: unknown[] }
@@ -167,10 +168,10 @@ export function PurchaseOrderDocumentImport({
       setError(caught instanceof Error ? caught.message : "No pudimos cargar equivalencias.");
     }
   };
-  const confirmLineProduct = (draft: DraftState, line: DocumentProductLine, sku: string) => {
+  const confirmLineProduct = (draft: DraftState, line: DocumentProductLine, sku: string, loaded?: SearchableProduct) => {
     if (!sku) { updateLine(draft.id, line.id, { sku: "", reviewed: false }); return; }
     const normalized = normalizeProductText(line.raw);
-    const catalogUnitsPerBox = products.find((product) => product.sku === sku)?.units_per_box ?? null;
+    const catalogUnitsPerBox = loaded?.units_per_box ?? products.find((product) => product.sku === sku)?.units_per_box ?? null;
     const confirmedAliases = new Map(draft.confirmedAliases);
     confirmedAliases.set(normalized, { source_text: line.raw, detected_code: line.detected_code || null, sku });
     patchDraft(draft.id, {
@@ -348,7 +349,7 @@ export function PurchaseOrderDocumentImport({
         {lineFilter === "missing" && <div className="missing-lines-panel">{missingLineCount(draft) ? <>Falta revisar {missingLineCount(draft)} línea{missingLineCount(draft) === 1 ? "" : "s"}. <button type="button" onClick={() => addLine(draft)}>Agregar producto faltante</button></> : "No faltan líneas por extraer."}</div>}
         <div className="table-scroll detected-products-table compact-product-review"><table><thead><tr><th>Producto del documento</th><th>Producto del catálogo</th><th>Cantidad</th><th>UxC</th><th>Unidades</th><th>Estado</th></tr></thead><tbody>{visibleLines(draft).map((line, index) => <tr className={`${selectedLineId === line.id ? "selected-source-row" : ""} confidence-${line.confidence}`} key={line.id} onClick={() => setSelectedLineId(line.id)}>
           <td><strong>{line.description || "Producto agregado manualmente"}</strong><small>{line.chain_code ? `Código: ${line.chain_code}` : ""}{line.supplier_reference ? ` · Referencia: ${line.supplier_reference}` : ""}</small>{line.bounds && <button className="text-button row-action" type="button" onClick={(event) => { event.stopPropagation(); setSelectedLineId(line.id); }}>Ver línea en el PDF</button>}</td>
-          <td><select aria-label={`Producto fila ${index + 1}`} value={line.sku} onClick={(event) => event.stopPropagation()} onChange={(event) => confirmLineProduct(draft, line, event.target.value)}><option value="">Corregir producto…</option>{products.map((product) => <option key={product.id ?? product.sku} value={product.sku}>{product.product_name} · SKU: {product.sku}</option>)}</select>{line.suggestions.length > 0 && <small>Posibles coincidencias: {line.suggestions.join(", ")}</small>}</td>
+          <td onClick={(event) => event.stopPropagation()}><ProductCombobox label={`Producto fila ${index + 1}`} value={line.sku} products={products} onSelect={(sku, product) => confirmLineProduct(draft, line, sku, product)} />{line.suggestions.length > 0 && <small>Posibles coincidencias: {line.suggestions.join(", ")}</small>}</td>
           <td><input aria-label={`Cantidad fila ${index + 1}`} type="number" min={1} value={line.original_quantity ?? ""} onClick={(event) => event.stopPropagation()} onChange={(event) => updateLine(draft.id, line.id, conversionPatch(line, { original_quantity: Number(event.target.value) || null }))} /><select aria-label={`Tipo fila ${index + 1}`} value={line.original_unit_type} onClick={(event) => event.stopPropagation()} onChange={(event) => updateLine(draft.id, line.id, conversionPatch(line, { original_unit_type: event.target.value as DocumentProductLine["original_unit_type"] }))}><option value="ambiguous">¿Tipo?</option><option value="boxes">Cajas</option><option value="units">Unidades</option></select></td>
           <td><input aria-label={`UxC fila ${index + 1}`} type="number" min={1} disabled={line.original_unit_type === "units"} value={line.units_per_box ?? ""} onClick={(event) => event.stopPropagation()} onChange={(event) => updateLine(draft.id, line.id, conversionPatch(line, { units_per_box: Number(event.target.value) || null }))} /></td>
           <td><strong>{line.calculated_units ?? "—"}</strong></td>

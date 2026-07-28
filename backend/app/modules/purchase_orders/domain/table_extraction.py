@@ -390,6 +390,46 @@ def _extract_known_text_layouts(
     return extracted
 
 
+def extract_known_ocr_text_rows(
+    text: str, page_number: int = 1
+) -> list[dict[str, Any]]:
+    """Recover known tabular layouts when OCR positions are too noisy to map columns."""
+    compact_identity = re.sub(r"[^A-Z0-9]", "", normalize_identity(text))
+    if "CORPORACIONFAVORITA" not in compact_identity:
+        return []
+
+    pattern = re.compile(
+        r"(?m)^\s*(\d{2})([A-ZÁÉÍÓÚÑ]+(?:\s+[A-ZÁÉÍÓÚÑ]+)*)\s+"
+        r"(\d+\s*[uU])\s+(\d+)\s+(\d{13})\s+(\d+)\s+"
+        r"[\d.,]+\s+(\d+)\s*$"
+    )
+    extracted: list[dict[str, Any]] = []
+    for match in pattern.finditer(text):
+        description_compact = re.sub(r"\s+", "", normalize_identity(match.group(2)))
+        if description_compact == "ANAPANITOSHUMEDOS":
+            description = "ANA PANITOS HUMEDOS"
+        else:
+            description = _clean_cell(match.group(2))
+        size = re.sub(r"\s+", " ", match.group(3).upper()).strip()
+        extracted.append(
+            {
+                "page": page_number,
+                "raw": match.group(0).strip(),
+                "item_number": match.group(1),
+                "chain_code": match.group(4),
+                "description": f"{description} {size}".strip(),
+                "supplier_reference": match.group(5),
+                "size": size,
+                "units_per_box": int(match.group(6)),
+                "quantity": int(match.group(7)),
+                "original_unit_type": "boxes",
+                "bounds": {"x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0},
+                "source": "known_ocr_text_layout",
+            }
+        )
+    return extracted
+
+
 def _text_bounds(page, needle: str) -> dict[str, float]:
     rectangles = page.search_for(needle)
     if not rectangles:

@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime
 from typing import Annotated, Literal
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, model_validator
@@ -31,6 +32,7 @@ class DeliveryLineInput(BaseModel):
 
 class DeliveryInput(BaseModel):
     invoice_id: uuid.UUID
+    delivered_at: datetime | None = None
     delivery_type: Literal["without_issue", "confirmed", "with_issue"]
     recipient: str | None = Field(default=None, max_length=160)
     notes: str | None = Field(default=None, max_length=2000)
@@ -49,6 +51,8 @@ def register_delivery(
     )
     if invoice is None:
         raise HTTPException(status_code=404, detail="No encontramos la factura.")
+    if invoice.administrative_status != "confirmed":
+        raise HTTPException(status_code=409, detail="La factura no está activa.")
     dispatched = db.scalar(
         select(func.coalesce(func.sum(DispatchLine.dispatched_quantity), 0))
         .join(Dispatch, Dispatch.id == DispatchLine.dispatch_id)
@@ -80,6 +84,8 @@ def register_delivery(
         notes=payload.notes,
         registered_by_user_id=user.id,
     )
+    if payload.delivered_at is not None:
+        item.delivered_at = payload.delivered_at
     db.add(item)
     db.flush()
     rejected_total = 0

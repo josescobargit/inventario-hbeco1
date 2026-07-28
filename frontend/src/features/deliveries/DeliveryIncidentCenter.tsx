@@ -17,6 +17,7 @@ export function DeliveryIncidentCenter() {
   const [trace, setTrace] = useState<Trace | null>(null);
   const [deliveryType, setDeliveryType] = useState("without_issue");
   const [deliveryLines, setDeliveryLines] = useState<DeliveryDraftLine[]>([]);
+  const [deliveryDate, setDeliveryDate] = useState(() => new Date().toLocaleDateString("en-CA"));
   const [recipient, setRecipient] = useState("");
   const [notes, setNotes] = useState("");
   const [resolvingId, setResolvingId] = useState<string | null>(null);
@@ -70,7 +71,7 @@ export function DeliveryIncidentCenter() {
     if (!selectedId) return;
     setSaving(true); setError(null); setSuccess(null);
     try {
-      const result = await apiRequest<{ invoice_number: string }>("/deliveries", { method: "POST", body: JSON.stringify({ invoice_id: selectedId, delivery_type: deliveryType, recipient: recipient || null, notes: notes || null, lines: deliveryLines.map((line) => ({ ...line, notes: line.notes || null })) }) });
+      const result = await apiRequest<{ invoice_number: string }>("/deliveries", { method: "POST", body: JSON.stringify({ invoice_id: selectedId, delivered_at: new Date(`${deliveryDate}T12:00:00`).toISOString(), delivery_type: deliveryType, recipient: recipient || null, notes: notes || null, lines: deliveryLines.map((line) => ({ ...line, notes: line.notes || null })) }) });
       const refreshed = await refresh();
       setSuccess(`${result.invoice_number} quedó marcada como entregada al cliente.`); setRecipient(""); setNotes(""); setTrace(null); setDeliveryLines([]);
       setSelectedId(refreshed.find((item) => item.dispatch_status !== "pending" && (item.delivery_status === "pending" || item.delivery_status === "partial_delivery"))?.id ?? null);
@@ -98,9 +99,10 @@ export function DeliveryIncidentCenter() {
           {selected && trace && <div className="delivery-summary"><strong>{selected.invoice_number}</strong><span>{selected.customer_name} · {trace.purchase_order?.chain ?? "Sin cadena"}</span><small>{trace.lines.reduce((sum, line) => sum + line.pending_delivery, 0)} unidades pendientes de recibir</small></div>}
           {trace && <div className="delivery-line-list"><h3>Productos recibidos por el cliente</h3>{trace.lines.filter((line) => line.pending_delivery > 0).map((line) => { const draft = deliveryLines.find((item) => item.sku === line.sku); const reported = (draft?.delivered_quantity ?? 0) + (draft?.rejected_quantity ?? 0); const exceeds = reported > line.pending_delivery; return <article className={exceeds ? "has-error" : ""} key={line.sku}><div><ProductIdentity name={line.product_name} sku={line.sku} /><small className="product-metrics">Despachado: {line.dispatched} · Ya recibido: {line.delivered} · Pendiente: {line.pending_delivery}</small></div><label><span>Recibido</span><input type="number" min={0} max={line.pending_delivery} value={draft?.delivered_quantity ?? 0} onChange={(event) => updateDeliveryLine(line.sku, { delivered_quantity: Number(event.target.value) })} /></label><label><span>Rechazado</span><input type="number" min={0} max={line.pending_delivery} value={draft?.rejected_quantity ?? 0} onChange={(event) => updateDeliveryLine(line.sku, { rejected_quantity: Number(event.target.value), notes: Number(event.target.value) > 0 ? draft?.notes ?? "" : "" })} /></label>{(draft?.rejected_quantity ?? 0) > 0 && <label className="delivery-line-note"><span>Motivo del rechazo *</span><input value={draft?.notes ?? ""} onChange={(event) => updateDeliveryLine(line.sku, { notes: event.target.value })} /></label>}{exceeds && <small className="validation-note">No puedes recibir/rechazar más de lo pendiente.</small>}</article>; })}</div>}
           <div className="delivery-type-grid">{Object.entries({ without_issue: "Sin novedad", confirmed: "Confirmada", with_issue: "Con novedad" }).map(([value, label]) => <button className={deliveryType === value ? "selected" : ""} type="button" key={value} onClick={() => setDeliveryType(value)}>{label}</button>)}</div>
+          <label className="full-field"><span>Fecha de entrega *</span><input type="date" required value={deliveryDate} onChange={(event) => setDeliveryDate(event.target.value)} /></label>
           <label className="full-field"><span>Recibido por</span><input value={recipient} onChange={(event) => setRecipient(event.target.value)} placeholder="Persona o área receptora" /></label>
           <label className="full-field"><span>{deliveryType === "with_issue" ? "Describe la novedad *" : "Observaciones"}</span><textarea required={deliveryType === "with_issue"} rows={4} value={notes} onChange={(event) => setNotes(event.target.value)} /></label>
-          <button className="primary-button full-action" type="button" disabled={saving || !selectedId || invalidDeliveryLines || ((deliveryType === "with_issue" || hasRejected) && notes.trim().length === 0)} onClick={registerDelivery}>{saving ? "Confirmando…" : "Registrar recepción del cliente"}</button>
+          <button className="primary-button full-action" type="button" disabled={saving || !selectedId || !deliveryDate || invalidDeliveryLines || ((deliveryType === "with_issue" || hasRejected) && notes.trim().length === 0)} onClick={registerDelivery}>{saving ? "Confirmando…" : "Registrar recepción del cliente"}</button>
         </>}
       </section>
 

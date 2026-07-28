@@ -24,6 +24,29 @@ const order = {
 const jsonResponse = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
 
 describe("PurchaseOrderCenter", () => {
+  it("carga solo resúmenes y solicita el detalle al seleccionar una OC", async () => {
+    const summary = {
+      id: "o1", order_number: "OC-10", chain_name: "Favorita", order_date: null,
+      destination: "CD Norte", status: "open", product_count: 1,
+    };
+    const fetchMock = vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/settings/operational")) return settingsResponse();
+      if (url.endsWith("/purchase-orders")) return jsonResponse({ items: [summary], next_cursor: null });
+      if (url.endsWith("/purchase-orders/o1")) return jsonResponse(order);
+      return emptyResponse();
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<PurchaseOrderCenter />);
+
+    const listItem = await screen.findByRole("button", { name: /OC-10.*Favorita.*1 producto/i });
+    expect(fetchMock.mock.calls.some((call) => String(call[0]).endsWith("/purchase-orders/o1"))).toBe(false);
+
+    fireEvent.click(listItem);
+    expect(await screen.findByRole("heading", { name: "OC OC-10" })).toBeVisible();
+    expect(fetchMock.mock.calls.filter((call) => String(call[0]).endsWith("/purchase-orders/o1"))).toHaveLength(1);
+  });
+
   it("explica la OC como documento de origen", async () => {
     vi.stubGlobal("fetch", mockApi());
     render(<PurchaseOrderCenter />);
@@ -108,9 +131,11 @@ describe("PurchaseOrderCenter", () => {
     render(<PurchaseOrderCenter />);
     await act(async () => { await Promise.resolve(); });
     fireEvent.click(screen.getByRole("button", { name: "Nueva OC" }));
+    await act(async () => { await Promise.resolve(); });
     fireEvent.change(screen.getByRole("combobox", { name: "Cadena" }), { target: { value: "Favorita" } });
     fireEvent.change(screen.getByRole("textbox", { name: "Número de OC *" }), { target: { value: "OC-12" } });
     fireEvent.change(screen.getByRole("combobox", { name: "Producto" }), { target: { value: "ACP001" } });
+    await act(async () => { vi.advanceTimersByTime(200); await Promise.resolve(); });
     fireEvent.click(screen.getByRole("option", { name: /ACP001/i }));
     fireEvent.click(screen.getByRole("button", { name: "Registrar OC" }));
     await act(async () => { await Promise.resolve(); });
@@ -258,7 +283,8 @@ describe("PurchaseOrderCenter", () => {
     render(<PurchaseOrderCenter />);
     await screen.findByText("OC-10");
 
-    fireEvent.click(screen.getByRole("button", { name: "Historial de cambios" }));
+    fireEvent.click(screen.getByText("OC-10").closest("button")!);
+    fireEvent.click(await screen.findByRole("button", { name: "Historial de cambios" }));
     expect(await screen.findByText("José Escobar")).toBeVisible();
     expect(screen.getByText("CD Sur")).toBeVisible();
     expect(screen.getByText(/modificaciones manuales posteriores/i)).toBeVisible();

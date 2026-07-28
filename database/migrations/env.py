@@ -21,6 +21,9 @@ from app.modules.settings.infrastructure import models as settings_models  # noq
 from app.modules.purchase_orders.infrastructure import models as purchase_order_models  # noqa: F401
 from app.modules.stock_adjustments.infrastructure import models as adjustment_models  # noqa: F401
 from app.modules.stock_imports.infrastructure import models as import_models  # noqa: F401
+from app.modules.supplier_invoices.infrastructure import (
+    models as supplier_invoice_models,
+)  # noqa: F401
 
 
 config = context.config

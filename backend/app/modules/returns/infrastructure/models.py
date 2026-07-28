@@ -20,6 +20,9 @@ class Return(Base):
     invoice_id: Mapped[uuid.UUID] = mapped_column(
         Uuid, ForeignKey("invoices.id", ondelete="RESTRICT"), nullable=False, index=True
     )
+    delivery_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("deliveries.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
     reason: Mapped[str] = mapped_column(Text, nullable=False)
     returned_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False, index=True

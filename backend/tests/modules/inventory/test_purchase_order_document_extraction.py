@@ -15,6 +15,9 @@ from app.main import app
 from app.core.database import get_db
 from app.modules.auth.api.dependencies import get_current_user
 from app.modules.purchase_orders.domain import document_extraction
+from app.modules.purchase_orders.domain.table_extraction import (
+    extract_known_ocr_text_rows,
+)
 from app.modules.purchase_orders.api.router import purchase_order_document_content
 
 
@@ -399,6 +402,62 @@ def test_supplied_purchase_orders_total_exactly_43_product_lines() -> None:
 
     assert extracted_counts == [4, 4, 6, 4, 9, 16]
     assert sum(extracted_counts) == 43
+
+
+@pytest.mark.parametrize(
+    ("filename", "expected_lines", "expected_units"),
+    [
+        ("WhatsApp Image 2026-07-27 at 09.58.52.jpeg", 1, 120),
+        ("WhatsApp Image 2026-07-27 at 15.49.30.jpeg", 5, 1446),
+    ],
+)
+def test_supplied_phone_images_preserve_boxes_uxc_and_units(
+    filename: str, expected_lines: int, expected_units: int
+) -> None:
+    path = SUPPLIED_OC_DIRECTORY / filename
+    if not path.exists():
+        pytest.skip("La imagen real está disponible en la validación local.")
+
+    try:
+        content = path.read_bytes()
+    except PermissionError:
+        pytest.skip("El entorno de pruebas no tiene permiso para leer Downloads.")
+    result = document_extraction.extract_document(content, "image/jpeg", filename)
+
+    assert len(result.table_rows) == expected_lines
+    assert (
+        sum(row["quantity"] * row["units_per_box"] for row in result.table_rows)
+        == expected_units
+    )
+
+
+def test_favorita_ocr_text_recovers_the_single_product_row() -> None:
+    rows = extract_known_ocr_text_rows(
+        "\n".join(
+            [
+                "CORPORACIONFAVORITAC.A.",
+                "ITDescripcion Tamano AcabadoS CodigoBarras UC.Prec.Costo",
+                "01ANAPANITOSHUMEDOS 100u 786213 7862133169244 12 1.3802 10",
+            ]
+        )
+    )
+
+    assert rows == [
+        {
+            "page": 1,
+            "raw": "01ANAPANITOSHUMEDOS 100u 786213 7862133169244 12 1.3802 10",
+            "item_number": "01",
+            "chain_code": "786213",
+            "description": "ANA PANITOS HUMEDOS 100U",
+            "supplier_reference": "7862133169244",
+            "size": "100U",
+            "units_per_box": 12,
+            "quantity": 10,
+            "original_unit_type": "boxes",
+            "bounds": {"x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0},
+            "source": "known_ocr_text_layout",
+        }
+    ]
 
 
 def test_frontend_purchase_order_import_route_matches_backend_contract() -> None:

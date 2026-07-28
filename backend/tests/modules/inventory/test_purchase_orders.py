@@ -1,4 +1,5 @@
 from datetime import date
+import uuid
 
 import pytest
 from fastapi import HTTPException
@@ -11,6 +12,10 @@ from app.modules.purchase_orders.api.router import (
     fulfillment_status,
     validate_line_conversion,
     validate_traceable_line_change,
+)
+from app.modules.purchase_orders.api import router as purchase_order_router
+from app.modules.purchase_orders.infrastructure.models import (
+    PurchaseOrderSourceDocument,
 )
 
 
@@ -72,6 +77,23 @@ def test_edit_blocks_quantity_below_invoiced_amount_with_real_reason() -> None:
     assert error.value.detail == (
         "No puedes reducir AE001 a 100 unidades porque ya se facturaron 120."
     )
+
+
+def test_new_purchase_order_documents_allow_metadata_without_binary() -> None:
+    assert PurchaseOrderSourceDocument.__table__.c.content.nullable is True
+
+
+def test_temporary_purchase_order_file_is_deleted_on_discard(
+    tmp_path, monkeypatch
+) -> None:
+    token = uuid.uuid4()
+    monkeypatch.setattr(purchase_order_router, "PREVIEW_DIRECTORY", tmp_path)
+
+    purchase_order_router.write_preview(token, b"%PDF-temporal")
+    assert purchase_order_router.preview_path(token).read_bytes() == b"%PDF-temporal"
+
+    purchase_order_router.delete_preview(token)
+    assert not purchase_order_router.preview_path(token).exists()
 
 
 def test_edit_blocks_removing_dispatched_product() -> None:

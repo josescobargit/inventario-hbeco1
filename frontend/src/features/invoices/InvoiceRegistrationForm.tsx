@@ -5,6 +5,7 @@ import {
   applyConfirmedAlias, parseInvoiceBlocks, parseProductLines,
   QuickBlock, QuickLine, retryProductRecognition,
 } from "./quickEntry";
+import { PurchaseOrderCombobox, PurchaseOrderSummary } from "../purchase-orders/PurchaseOrderCombobox";
 
 interface Availability {
   id: string; sku: string; product_name: string; barcode: string | null;
@@ -14,7 +15,7 @@ interface OrderLine {
   sku: string; product_name: string; ordered_quantity: number; invoiced_quantity: number;
   remaining_quantity: number; available: number; suggested_to_invoice: number;
 }
-interface Order { id: string; order_number: string; chain_name: string; customer_name: string | null; lines: OrderLine[] }
+interface Order { id: string; order_number: string; chain_name: string; customer_name: string | null; status: string; destination: string | null; product_count: number; lines: OrderLine[] }
 interface Reservation { id: string; status: string; purchase_order_reference: string | null; customer_name: string | null; lines: Array<{ sku: string; remaining_quantity: number }> }
 interface InvoiceSummary { invoice_number: string }
 interface DraftLine { sku: string; quantity: number; unit_price: string }
@@ -40,6 +41,17 @@ const today = () => new Date().toLocaleDateString("en-CA");
 const invoicePattern = /^\d{3}-\d{3}-\d{9}$/;
 const BULK_STORAGE_KEY = "inventario.invoiceBulkDraft.v2";
 const BULK_ID_STORAGE_KEY = "inventario.invoiceBulkId.v2";
+interface InventoryEffect {
+  sku: string;
+  physical_confirmed: number;
+  available_to_invoice: number;
+}
+
+const announceInventoryChange = (effects: InventoryEffect[]) => {
+  if (effects.length) {
+    window.dispatchEvent(new CustomEvent("inventario:inventory-changed", { detail: effects }));
+  }
+};
 
 export function InvoiceRegistrationForm({ onCreated, onCancel, template, editing = false }: { onCreated: (id: string) => Promise<void>; onCancel: () => void; template?: InvoiceTemplate | null; editing?: boolean }) {
   const [mode, setMode] = useState<"individual" | "bulk">("individual");
@@ -78,13 +90,21 @@ export function InvoiceRegistrationForm({ onCreated, onCancel, template, editing
   });
   const submitLock = useRef(false);
   const idempotencyKey = useRef<string | null>(null);
+  const applyInventoryEffects = (effects: InventoryEffect[]) => {
+    const bySku = new Map(effects.map((effect) => [effect.sku, effect]));
+    setProducts((current) => current.map((product) => {
+      const effect = bySku.get(product.sku);
+      return effect ? { ...product, available_to_invoice: effect.available_to_invoice } : product;
+    }));
+    announceInventoryChange(effects);
+  };
 
   useEffect(() => {
     Promise.all([
-      apiRequest<Order[]>("/purchase-orders"), apiRequest<Reservation[]>("/reservations"),
-      apiRequest<Availability[]>("/inventory/availability"), apiRequest<InvoiceSummary[]>("/invoices"),
-    ]).then(([loadedOrders, loadedReservations, loadedProducts, invoices]) => {
-      setOrders(loadedOrders); setReservations(loadedReservations); setProducts(loadedProducts);
+      apiRequest<Reservation[]>("/reservations"),
+      apiRequest<Availability[]>("/inventory/availability?limit=100"), apiRequest<InvoiceSummary[]>("/invoices"),
+    ]).then(([loadedReservations, loadedProducts, invoices]) => {
+      setReservations(loadedReservations); setProducts(loadedProducts);
       setRegisteredNumbers(new Set(invoices.map((item) => item.invoice_number)));
       try {
         const saved = globalThis.localStorage?.getItem(BULK_STORAGE_KEY);
@@ -106,13 +126,30 @@ export function InvoiceRegistrationForm({ onCreated, onCancel, template, editing
   const availableReservations = useMemo(() => reservations.filter((item) => item.status === "active" && (!selectedOrder || item.purchase_order_reference === selectedOrder.order_number)), [reservations, selectedOrder]);
   const originalBySku = new Map(selectedOrder?.lines.map((line) => [line.sku, line]) ?? []);
 
-  const chooseOrder = (id: string) => {
+  const chooseOrder = async (id: string, loaded?: Order) => {
     setOrderId(id); setSelectedReservations([]); setConfirmed(false);
-    const order = orders.find((item) => item.id === id);
+    let order = loaded ?? orders.find((item) => item.id === id);
+    if (!order && id) {
+      order = await apiRequest<Order>(`/purchase-orders/${id}`);
+      order = { ...order, product_count: order.lines.length };
+      setOrders((current) => [...current.filter((item) => item.id !== id), order!]);
+    }
     if (!order) { setLines([]); setCustomer(""); setChain(""); return; }
     setCustomer(order.customer_name ?? order.chain_name); setChain(order.chain_name);
     setLines(order.lines.map((line) => ({ sku: line.sku, quantity: line.suggested_to_invoice, unit_price: "" })));
   };
+
+  useEffect(() => {
+    if (!template?.purchase_order_id || orders.some((order) => order.id === template.purchase_order_id)) return;
+    void apiRequest<Order>(`/purchase-orders/${template.purchase_order_id}`).then((order) => {
+      const normalized = { ...order, product_count: order.lines.length };
+      setOrders((current) => [...current, normalized]);
+      void chooseOrder(normalized.id, normalized);
+    });
+  // The invoice template is applied once when the form is initialized.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [template?.purchase_order_id]);
+
   const updateLine = (index: number, patch: Partial<DraftLine>) => {
     setConfirmed(false);
     setLines((current) => current.map((line, lineIndex) => lineIndex === index ? { ...line, ...patch } : line));
@@ -129,7 +166,7 @@ export function InvoiceRegistrationForm({ onCreated, onCancel, template, editing
     setSaving(true);
     idempotencyKey.current ??= crypto.randomUUID();
     try {
-      const created = await apiRequest<{ id: string }>(editing && template ? `/invoices/${template.id}` : "/invoices", { method: editing ? "PUT" : "POST", headers: { "Idempotency-Key": idempotencyKey.current }, body: JSON.stringify({
+      const created = await apiRequest<{ id: string; inventory_affected?: InventoryEffect[] }>(editing && template ? `/invoices/${template.id}` : "/invoices", { method: editing ? "PUT" : "POST", headers: { "Idempotency-Key": idempotencyKey.current }, body: JSON.stringify({
         invoice_number: number, invoice_date: date, source_type: sourceType,
         purchase_order_id: sourceType === "purchase_order" ? orderId : null,
         customer_name: customer, chain_name: chain || null, authorization_number: authorization || null,
@@ -138,6 +175,7 @@ export function InvoiceRegistrationForm({ onCreated, onCancel, template, editing
         lines: activeLines.map((line) => ({ sku: line.sku, quantity: line.quantity, unit_price: line.unit_price ? Number(line.unit_price) : null })),
       }) });
       idempotencyKey.current = null;
+      applyInventoryEffects(created.inventory_affected ?? []);
       await onCreated(created.id);
     } catch (caught) { setError(caught instanceof Error ? caught.message : "No pudimos registrar la factura."); }
     finally { submitLock.current = false; setSaving(false); }
@@ -277,7 +315,7 @@ export function InvoiceRegistrationForm({ onCreated, onCancel, template, editing
     const savingIds = new Set(validBlocks.map((block) => block.id));
     setBlocks((current) => current.map((block) => savingIds.has(block.id) ? { ...block, save_status: "processing" } : block));
     try {
-      const created = await apiRequest<{ invoices: Array<{ id?: string; invoice_number: string; status: "saved" | "duplicate" | "error"; detail?: string }>; summary: { saved: number; duplicates: number; errors: number } }>("/invoices/bulk", {
+      const created = await apiRequest<{ invoices: Array<{ id?: string; invoice_number: string; status: "saved" | "duplicate" | "error"; detail?: string; inventory_affected?: InventoryEffect[] }>; summary: { saved: number; duplicates: number; errors: number } }>("/invoices/bulk", {
         method: "POST", body: JSON.stringify({ batch_id: bulkId, invoices: validBlocks.map((block) => ({
           invoice_number: block.invoice_number, invoice_date: block.invoice_date,
           purchase_order_id: block.order_id, is_void: block.is_void,
@@ -286,6 +324,7 @@ export function InvoiceRegistrationForm({ onCreated, onCancel, template, editing
           lines: block.is_void ? [] : block.lines.map((line) => ({ sku: line.sku, quantity: line.quantity })),
         })) }),
       });
+      applyInventoryEffects(created.invoices.flatMap((item) => item.inventory_affected ?? []));
       const byNumber = new Map(created.invoices.map((item) => [item.invoice_number, item]));
       setBlocks((current) => current.map((block) => {
         const result = byNumber.get(block.invoice_number);
@@ -293,7 +332,8 @@ export function InvoiceRegistrationForm({ onCreated, onCancel, template, editing
       }));
       setRegisteredNumbers((current) => new Set([...current, ...created.invoices.filter((item) => item.status !== "error").map((item) => item.invoice_number)]));
       const firstSaved = created.invoices.find((item) => item.status === "saved" && item.id);
-      setBulkMessage(`${created.summary.saved} guardadas, ${created.summary.duplicates} duplicadas y ${created.summary.errors} con error.`);
+      const inventoryCount = created.invoices.filter((item) => item.status === "saved" && (item.inventory_affected?.length ?? 0) > 0).length;
+      setBulkMessage(`${created.summary.saved} guardadas, ${created.summary.duplicates} duplicadas y ${created.summary.errors} con error. ${inventoryCount} afectaron inventario.`);
       if (firstSaved?.id && created.summary.errors === 0) await onCreated(firstSaved.id);
       if (created.summary.errors) setError("Las facturas con error permanecen en la bandeja para corregirlas y reintentar.");
     } catch (caught) { setError(caught instanceof Error ? caught.message : "No pudimos guardar la carga."); }
@@ -311,7 +351,7 @@ export function InvoiceRegistrationForm({ onCreated, onCancel, template, editing
     {mode === "individual" && <form onSubmit={submit}>
       <div className="form-grid">
         <label><span>Origen *</span><select value={sourceType} onChange={(event) => { setSourceType(event.target.value); setOrderId(""); setLines([]); setSelectedReservations([]); setConfirmed(false); }}>{Object.entries(sourceLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
-        {sourceType === "purchase_order" && <label><span>OC vinculada *</span><select required value={orderId} onChange={(event) => chooseOrder(event.target.value)}><option value="">Selecciona la OC</option>{orders.map((order) => <option key={order.id} value={order.id}>{order.chain_name} · {order.order_number}</option>)}</select></label>}
+        {sourceType === "purchase_order" && <PurchaseOrderCombobox label="OC vinculada *" value={(selectedOrder as PurchaseOrderSummary | null)} onSelect={(summary) => { if (!summary) { void chooseOrder(""); return; } void chooseOrder(summary.id); }} />}
         <label><span>Número de factura *</span><input required pattern="\d{3}-\d{3}-\d{9}" placeholder="001-001-000000686" value={number} onChange={(event) => { setNumber(event.target.value); setConfirmed(false); }} /></label>
         <label><span>Fecha *</span><input required type="date" value={date} onChange={(event) => { setDate(event.target.value); setConfirmed(false); }} /></label>
         <label><span>{sourceType === "purchase_order" ? "Cliente/Cadena *" : "Cliente *"}</span><input required minLength={2} readOnly={sourceType === "purchase_order"} value={customer} onChange={(event) => setCustomer(event.target.value)} /></label>
@@ -352,7 +392,7 @@ export function InvoiceRegistrationForm({ onCreated, onCancel, template, editing
       {blocks.length > 0 && <div className="bulk-summary"><div><span>Documentos</span><strong>{blocks.length}</strong></div><div><span>Reconocidos</span><strong>{validBlocks.length}</strong></div><div><span>Requieren revisión</span><strong>{blocks.filter((block) => blockErrors(block).length && block.save_status !== "duplicate").length}</strong></div><div><span>Duplicados</span><strong>{blocks.filter((block) => block.save_status === "duplicate" || registeredNumbers.has(block.invoice_number)).length}</strong></div><div><span>Procesando</span><strong>{blocks.filter((block) => block.save_status === "processing").length}</strong></div><div><span>Guardadas</span><strong>{blocks.filter((block) => block.save_status === "saved").length}</strong></div><div><span>Total unidades</span><strong>{totalUnits}</strong></div></div>}
       <div className="invoice-blocks">{blocks.map((block, index) => { const order = orders.find((item) => item.id === block.order_id); const errors = blockErrors(block); const differences = differenceCount(block); return <article className={`invoice-block ${errors.length ? "with-errors" : block.is_void ? "is-void" : differences ? "with-warning" : "valid"}`} key={block.id}>
         <header><div><span className="status-pill">{block.save_status === "saved" ? "Guardada" : block.save_status === "processing" ? "Procesando" : block.save_status === "duplicate" ? "Posible duplicado" : block.save_status === "error" ? "Error" : block.is_void ? "Anulada" : errors.length ? "Requiere revisión" : differences ? "Lista con diferencias" : "Lista para guardar"}</span><h3>Factura {index + 1}</h3></div><div className="block-actions">{!block.is_void && <button type="button" onClick={() => patchBlock(block.id, { lines: [...block.lines, { id: `line-new-${Date.now()}`, raw: "Producto agregado", quantity: 1, sku: "", error: "Selecciona un producto.", suggestions: [] }] })}>Agregar producto</button>}<button type="button" onClick={() => duplicateBlock(block)}>Duplicar</button><button type="button" onClick={() => patchBlock(block.id, { is_void: !block.is_void })}>{block.is_void ? "Activar" : "Anular"}</button><button type="button" onClick={() => setBlocks((current) => current.filter((item) => item.id !== block.id))}>Eliminar</button></div></header>
-        <div className="form-grid compact"><label><span>Número *</span><input value={block.invoice_number} onChange={(event) => patchBlock(block.id, { invoice_number: event.target.value })} /></label><label><span>OC *</span><select value={block.order_id} onChange={(event) => patchBlock(block.id, { order_id: event.target.value })}><option value="">Selecciona la OC</option>{orders.map((item) => <option key={item.id} value={item.id}>{item.chain_name} · {item.order_number}</option>)}</select></label><label><span>Cliente/Cadena</span><input readOnly value={order ? order.customer_name ?? order.chain_name : ""} /></label><label><span>Fecha *</span><input type="date" value={block.invoice_date} onChange={(event) => patchBlock(block.id, { invoice_date: event.target.value })} /></label><label><span>Autorización</span><input value={block.authorization} onChange={(event) => patchBlock(block.id, { authorization: event.target.value })} /></label><label><span>Guía</span><input value={block.guide} onChange={(event) => patchBlock(block.id, { guide: event.target.value })} /></label><label><span>Valor total</span><input type="number" min="0" step="0.01" value={block.total} onChange={(event) => patchBlock(block.id, { total: event.target.value })} /></label></div>
+        <div className="form-grid compact"><label><span>Número *</span><input value={block.invoice_number} onChange={(event) => patchBlock(block.id, { invoice_number: event.target.value })} /></label><PurchaseOrderCombobox label="OC *" value={(order as PurchaseOrderSummary | null)} onSelect={async (summary) => { if (!summary) { patchBlock(block.id, { order_id: "" }); return; } await chooseOrder(summary.id); patchBlock(block.id, { order_id: summary.id }); }} /><label><span>Cliente/Cadena</span><input readOnly value={order ? order.customer_name ?? order.chain_name : ""} /></label><label><span>Fecha *</span><input type="date" value={block.invoice_date} onChange={(event) => patchBlock(block.id, { invoice_date: event.target.value })} /></label><label><span>Autorización</span><input value={block.authorization} onChange={(event) => patchBlock(block.id, { authorization: event.target.value })} /></label><label><span>Guía</span><input value={block.guide} onChange={(event) => patchBlock(block.id, { guide: event.target.value })} /></label><label><span>Valor total</span><input type="number" min="0" step="0.01" value={block.total} onChange={(event) => patchBlock(block.id, { total: event.target.value })} /></label></div>
         {!block.is_void && <div className="block-lines">{block.lines.map((line) => <div className={!line.sku || !line.quantity ? "unrecognized-line" : ""} key={line.id}><label><span>{line.raw}</span><select value={line.sku} onChange={(event) => confirmBulkProduct(line.id, line.raw, event.target.value)}><option value="">Producto no reconocido</option>{products.map((product) => <option key={product.id} value={product.sku}>{product.product_name} · SKU: {product.sku}</option>)}</select>{line.suggestions.length > 0 && <small>Sugerencias: {line.suggestions.join(", ")}</small>}</label><label><span>Unidades</span><input type="number" min={1} value={line.quantity ?? ""} onChange={(event) => patchBlockLine(block.id, line.id, { quantity: Number(event.target.value) })} /></label><button type="button" aria-label="Eliminar línea" onClick={() => patchBlock(block.id, { lines: block.lines.filter((item) => item.id !== line.id) })}>×</button>{line.error && <small className="field-error">{line.error}</small>}</div>)}</div>}
         <footer><span>{block.lines.length} productos · {block.lines.reduce((sum, line) => sum + (line.quantity ?? 0), 0)} unidades</span><span>{differences} diferencias frente a la OC</span></footer>
         {(block.filename || block.save_status || block.save_detail) && <p><strong>{block.save_status === "saved" ? "Guardada" : block.save_status === "processing" ? "Procesando" : block.save_status === "duplicate" ? "Posible duplicado" : block.save_status === "error" ? "Error" : "Pendiente"}</strong>{block.filename ? ` · ${block.filename}` : ""}{block.save_detail ? ` · ${block.save_detail}` : ""}</p>}

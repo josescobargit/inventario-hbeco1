@@ -8,10 +8,12 @@ def test_health_endpoint() -> None:
     response = TestClient(app).get("/health")
 
     assert response.status_code == 200
-    assert response.json() == {
-        "status": "ok",
-        "service": "inventario-operativo-api",
-    }
+    payload = response.json()
+    assert payload["status"] == "ok"
+    assert payload["service"] == "inventario-operativo-api"
+    assert payload["version"]
+    assert payload["deployed_at"]
+    assert payload["environment"] == "test"
 
 
 def test_database_failure_has_a_non_technical_message() -> None:

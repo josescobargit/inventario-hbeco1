@@ -25,6 +25,7 @@ from app.modules.stock_imports.api.router import router as stock_imports_router
 from app.modules.stock_imports.api.persistence_router import (
     router as stock_import_persistence_router,
 )
+from app.modules.supplier_invoices.api.router import router as supplier_invoices_router
 
 
 api_router = APIRouter()
@@ -49,3 +50,4 @@ api_router.include_router(purchase_orders_router)
 api_router.include_router(stock_adjustments_router)
 api_router.include_router(stock_imports_router)
 api_router.include_router(stock_import_persistence_router)
+api_router.include_router(supplier_invoices_router)

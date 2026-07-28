@@ -1,11 +1,16 @@
+import base64
+import json
+import tempfile
+import threading
 import uuid
 from hashlib import sha256
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Annotated
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from app.core.database import get_db
@@ -97,6 +102,8 @@ class OrderUpdateInput(BaseModel):
 
 
 router = APIRouter(prefix="/purchase-orders", tags=["Órdenes de compra"])
+PREVIEW_TTL = timedelta(hours=2)
+PREVIEW_DIRECTORY = Path(tempfile.gettempdir()) / "inventario-purchase-order-previews"
 
 CHAIN_ALIASES = {
     "TUTI": "TUTI",
@@ -112,6 +119,13 @@ def canonical_chain_name(value: str) -> str:
     """Return the user-facing identity used for new purchase orders."""
     clean = " ".join(value.strip().split())
     return CHAIN_ALIASES.get(normalize_identity(clean), clean)
+
+
+def normalized_search_field(field):
+    expression = func.lower(func.coalesce(field, ""))
+    for accented, plain in zip("áéíóúüñ", "aeiouun", strict=True):
+        expression = func.replace(expression, accented, plain)
+    return expression
 
 
 def validate_line_conversion(line: LineInput) -> None:
@@ -345,7 +359,8 @@ def detail(db: Session, order: PurchaseOrder) -> dict:
             "content_type": document.content_type,
             "extraction_method": document.extraction_method,
             "page_count": document.page_count,
-            "size_bytes": len(document.content),
+            "size_bytes": len(document.content) if document.content else 0,
+            "available": document.content is not None,
             "uploaded_at": document.created_at,
             "uploaded_by_user_id": document.created_by_user_id,
             "sha256": document.sha256,
@@ -434,14 +449,116 @@ def detail(db: Session, order: PurchaseOrder) -> dict:
     }
 
 
+def encode_order_cursor(created_at: datetime, order_id: uuid.UUID) -> str:
+    payload = json.dumps(
+        {"created_at": created_at.isoformat(), "id": str(order_id)},
+        separators=(",", ":"),
+    ).encode()
+    return base64.urlsafe_b64encode(payload).decode().rstrip("=")
+
+
+def decode_order_cursor(cursor: str) -> tuple[datetime, uuid.UUID]:
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded))
+        return datetime.fromisoformat(payload["created_at"]), uuid.UUID(payload["id"])
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
+        raise HTTPException(status_code=422, detail="El cursor de paginación no es válido.") from error
+
+
 @router.get("")
-def list_orders(_user: CurrentUser, db: Annotated[Session, Depends(get_db)]):
-    return [
-        detail(db, order)
-        for order in db.scalars(
-            select(PurchaseOrder).order_by(PurchaseOrder.created_at.desc())
-        ).all()
+def list_orders(
+    _user: CurrentUser,
+    db: Annotated[Session, Depends(get_db)],
+    search: Annotated[str | None, Query(max_length=120)] = None,
+    chain: Annotated[str | None, Query(max_length=160)] = None,
+    status: Annotated[str | None, Query(max_length=30)] = None,
+    date_from: Annotated[date | None, Query()] = None,
+    date_to: Annotated[date | None, Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=50)] = 25,
+    cursor: Annotated[str | None, Query(max_length=300)] = None,
+):
+    line_counts = (
+        select(
+            PurchaseOrderLine.purchase_order_id.label("purchase_order_id"),
+            func.count(PurchaseOrderLine.id).label("product_count"),
+        )
+        .group_by(PurchaseOrderLine.purchase_order_id)
+        .subquery()
+    )
+    statement = (
+        select(PurchaseOrder, func.coalesce(line_counts.c.product_count, 0))
+        .outerjoin(
+            line_counts, line_counts.c.purchase_order_id == PurchaseOrder.id
+        )
+        .order_by(PurchaseOrder.created_at.desc(), PurchaseOrder.id.desc())
+    )
+    if search and search.strip():
+        normalized_terms = (
+            search.strip()
+            .lower()
+            .translate(str.maketrans("áéíóúüñ", "aeiouun"))
+            .split()
+        )
+        searchable_fields = [
+            normalized_search_field(field)
+            for field in (
+                PurchaseOrder.order_number,
+                PurchaseOrder.chain_name,
+                PurchaseOrder.status,
+                PurchaseOrder.destination,
+            )
+        ]
+        statement = statement.where(
+            and_(
+                *[
+                    or_(*[field.like(f"%{term}%") for field in searchable_fields])
+                    for term in normalized_terms
+                ]
+            )
+        )
+    if chain and chain.strip():
+        statement = statement.where(
+            func.lower(PurchaseOrder.chain_name) == canonical_chain_name(chain).lower()
+        )
+    if status and status.strip():
+        statement = statement.where(PurchaseOrder.status == status.strip())
+    if date_from:
+        statement = statement.where(PurchaseOrder.order_date >= date_from)
+    if date_to:
+        statement = statement.where(PurchaseOrder.order_date <= date_to)
+    if cursor:
+        cursor_date, cursor_id = decode_order_cursor(cursor)
+        statement = statement.where(
+            or_(
+                PurchaseOrder.created_at < cursor_date,
+                and_(
+                    PurchaseOrder.created_at == cursor_date,
+                    PurchaseOrder.id < cursor_id,
+                ),
+            )
+        )
+    rows = db.execute(statement.limit(limit + 1)).all()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    items = [
+        {
+            "id": order.id,
+            "order_number": order.order_number,
+            "chain_name": canonical_chain_name(order.chain_name),
+            "order_date": order.order_date,
+            "status": order.status,
+            "destination": order.destination,
+            "product_count": int(product_count),
+        }
+        for order, product_count in rows
     ]
+    next_cursor = (
+        encode_order_cursor(rows[-1][0].created_at, rows[-1][0].id)
+        if has_more and rows
+        else None
+    )
+    return {"items": items, "next_cursor": next_cursor}
 
 
 ALLOWED_DOCUMENT_TYPES = {
@@ -452,6 +569,43 @@ ALLOWED_DOCUMENT_TYPES = {
     "text/plain",
 }
 MAX_DOCUMENT_BYTES = 15 * 1024 * 1024
+
+
+def preview_path(token: uuid.UUID) -> Path:
+    return PREVIEW_DIRECTORY / str(token)
+
+
+def write_preview(token: uuid.UUID, content: bytes) -> None:
+    PREVIEW_DIRECTORY.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = preview_path(token)
+    path.write_bytes(content)
+    path.chmod(0o600)
+    cleanup = threading.Timer(
+        PREVIEW_TTL.total_seconds(), delete_preview, args=(token,)
+    )
+    cleanup.daemon = True
+    cleanup.start()
+
+
+def delete_preview(token: uuid.UUID) -> None:
+    preview_path(token).unlink(missing_ok=True)
+
+
+def purge_expired_previews(db: Session) -> None:
+    cutoff = datetime.now(timezone.utc) - PREVIEW_TTL
+    expired = db.scalars(
+        select(PurchaseOrderSourceDocument).where(
+            PurchaseOrderSourceDocument.created_at < cutoff,
+            ~PurchaseOrderSourceDocument.id.in_(
+                select(PurchaseOrderDocumentLink.document_id)
+            ),
+        )
+    ).all()
+    for document in expired:
+        delete_preview(document.upload_token)
+        db.delete(document)
+    if expired:
+        db.commit()
 
 
 @router.post("/imports/preview")
@@ -481,8 +635,10 @@ async def preview_purchase_order_documents(
         raise HTTPException(
             status_code=422, detail="Carga un documento o pega el pedido."
         )
+    purge_expired_previews(db)
 
     drafts = []
+    temporary_files: list[tuple[uuid.UUID, bytes]] = []
     for filename, content_type, content in inputs:
         digest = sha256(content).hexdigest()
         try:
@@ -508,7 +664,7 @@ async def preview_purchase_order_documents(
         document = PurchaseOrderSourceDocument(
             original_filename=filename,
             content_type=content_type,
-            content=content,
+            content=None,
             sha256=digest,
             extraction_method=method,
             extracted_text=extracted_text,
@@ -571,7 +727,16 @@ async def preview_purchase_order_documents(
                     "separation_needs_review": len(parts) > 1,
                 }
             )
-    db.commit()
+        temporary_files.append((document.upload_token, content))
+    try:
+        for token, content in temporary_files:
+            write_preview(token, content)
+        db.commit()
+    except Exception:
+        db.rollback()
+        for token, _content in temporary_files:
+            delete_preview(token)
+        raise
     return {"drafts": drafts}
 
 
@@ -597,9 +762,18 @@ def purchase_order_document_content(
     )
     if document is None or (document.created_by_user_id != user.id and not linked):
         raise HTTPException(status_code=404, detail="No encontramos el documento.")
+    temporary_content = preview_path(document.upload_token)
+    content = document.content
+    if content is None and temporary_content.exists() and not linked:
+        content = temporary_content.read_bytes()
+    if content is None:
+        raise HTTPException(
+            status_code=410,
+            detail="El archivo original no se conserva después de confirmar la OC.",
+        )
     safe_name = document.original_filename.replace('"', "")
     return Response(
-        content=document.content,
+        content=content,
         media_type=document.content_type,
         headers={
             "Content-Disposition": f'inline; filename="{safe_name}"',
@@ -631,6 +805,7 @@ def discard_purchase_order_document(
         )
     ):
         return Response(status_code=204)
+    delete_preview(document.upload_token)
     db.delete(document)
     db.commit()
     return Response(status_code=204)
@@ -1043,7 +1218,7 @@ async def attach_corrected_document(
     document = PurchaseOrderSourceDocument(
         original_filename=file.filename or "documento-corregido",
         content_type=content_type,
-        content=content,
+        content=None,
         sha256=digest,
         extraction_method=extracted.method,
         extracted_text=extracted.text,
@@ -1232,4 +1407,6 @@ def create_order(
         raise HTTPException(
             status_code=409, detail="Esta cadena ya tiene una OC con ese número."
         ) from error
+    for document in documents:
+        delete_preview(document.upload_token)
     return detail(db, order)

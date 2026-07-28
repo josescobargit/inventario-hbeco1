@@ -89,6 +89,12 @@ class InventoryMovement(Base):
     product_id: Mapped[uuid.UUID] = mapped_column(
         Uuid, ForeignKey("products.id", ondelete="RESTRICT"), nullable=False, index=True
     )
+    purchase_order_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid,
+        ForeignKey("purchase_orders.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
     actor_user_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
     )
@@ -99,6 +105,7 @@ class InventoryMovement(Base):
         String(160), unique=True, nullable=True, index=True
     )
     batch_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True, index=True)
+    quantity: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     reason: Mapped[str] = mapped_column(Text, nullable=False)
     before_value: Mapped[dict[str, Any]] = mapped_column(json_type, nullable=False)
     after_value: Mapped[dict[str, Any]] = mapped_column(json_type, nullable=False)

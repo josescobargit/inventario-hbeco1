@@ -13,6 +13,7 @@ import pytesseract
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
 from app.modules.purchase_orders.domain.table_extraction import (
+    extract_known_ocr_text_rows,
     extract_pdf_table_rows,
     extract_visual_word_rows,
 )
@@ -362,6 +363,8 @@ def extract_document(
     image = Image.open(io.BytesIO(content))
     text, method, words, size = _ocr_image(image)
     rows = extract_visual_word_rows(words, float(size[0]), 1) if words else []
+    if not rows:
+        rows = extract_known_ocr_text_rows(text)
     return ExtractedDocument(
         text=f"[[PAGE:1]]\n{text.strip()}",
         method=method,

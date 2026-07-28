@@ -9,6 +9,7 @@ from app.modules.audit.infrastructure.models import AuditLog
 from app.modules.auth.api.dependencies import CurrentUser
 from app.modules.catalog.infrastructure.models import Product
 from app.modules.dispatches.infrastructure.models import Dispatch, DispatchLine
+from app.modules.deliveries.infrastructure.models import Delivery, DeliveryLine
 from app.modules.incidents.infrastructure.models import Incident
 from app.modules.inventory.infrastructure.models import (
     InventoryMovement,
@@ -34,6 +35,7 @@ class LineInput(BaseModel):
 
 class ReturnInput(BaseModel):
     invoice_id: uuid.UUID
+    delivery_id: uuid.UUID | None = None
     reason: str = Field(min_length=5, max_length=1000)
     lines: list[LineInput] = Field(min_length=1)
 
@@ -50,6 +52,21 @@ def register_return(
     )
     if invoice is None:
         raise HTTPException(status_code=404, detail="No encontramos la factura.")
+    if invoice.administrative_status != "confirmed":
+        raise HTTPException(status_code=409, detail="La factura no está activa.")
+    delivery = None
+    if payload.delivery_id:
+        delivery = db.scalar(
+            select(Delivery).where(
+                Delivery.id == payload.delivery_id,
+                Delivery.invoice_id == invoice.id,
+            )
+        )
+        if delivery is None:
+            raise HTTPException(
+                status_code=422,
+                detail="La entrega seleccionada no pertenece a esta factura.",
+            )
     skus = [x.sku.strip().upper() for x in payload.lines]
     if len(set(skus)) != len(skus):
         raise HTTPException(
@@ -70,6 +87,7 @@ def register_return(
         )
     item = Return(
         invoice_id=invoice.id,
+        delivery_id=delivery.id if delivery else None,
         reason=payload.reason.strip(),
         registered_by_user_id=user.id,
     )
@@ -77,25 +95,42 @@ def register_return(
     db.flush()
     for report in payload.lines:
         line, product, pos = found[report.sku.strip().upper()]
-        dispatched = db.scalar(
-            select(func.coalesce(func.sum(DispatchLine.dispatched_quantity), 0))
-            .join(Dispatch, Dispatch.id == DispatchLine.dispatch_id)
-            .where(
-                Dispatch.invoice_id == invoice.id,
-                DispatchLine.invoice_line_id == line.id,
+        eligible = (
+            db.scalar(
+                select(func.coalesce(func.sum(DeliveryLine.delivered_quantity), 0))
+                .join(Delivery, Delivery.id == DeliveryLine.delivery_id)
+                .where(
+                    Delivery.id == delivery.id,
+                    DeliveryLine.invoice_line_id == line.id,
+                )
+            )
+            if delivery
+            else db.scalar(
+                select(func.coalesce(func.sum(DispatchLine.dispatched_quantity), 0))
+                .join(Dispatch, Dispatch.id == DispatchLine.dispatch_id)
+                .where(
+                    Dispatch.invoice_id == invoice.id,
+                    DispatchLine.invoice_line_id == line.id,
+                )
             )
         )
-        returned = db.scalar(
+        returned_statement = (
             select(func.coalesce(func.sum(ReturnLine.quantity), 0))
             .join(Return, Return.id == ReturnLine.return_id)
             .where(
-                Return.invoice_id == invoice.id, ReturnLine.invoice_line_id == line.id
+                Return.invoice_id == invoice.id,
+                ReturnLine.invoice_line_id == line.id,
             )
         )
-        if returned + report.quantity > dispatched:
+        if delivery:
+            returned_statement = returned_statement.where(
+                Return.delivery_id == delivery.id
+            )
+        returned = db.scalar(returned_statement)
+        if returned + report.quantity > eligible:
             raise HTTPException(
                 status_code=409,
-                detail=f"{product.sku}: solo pueden devolverse {dispatched - returned} unidades.",
+                detail=f"{product.sku}: solo pueden devolverse {eligible - returned} unidades.",
             )
         before = {
             "physical_confirmed": pos.physical_confirmed,
@@ -131,10 +166,12 @@ def register_return(
             InventoryMovement(
                 warehouse_id=pos.warehouse_id,
                 product_id=pos.product_id,
+                purchase_order_id=invoice.purchase_order_id,
                 actor_user_id=user.id,
                 movement_type="customer_return",
                 reference_type="return",
                 reference_id=str(item.id),
+                quantity=report.quantity,
                 reason=item.reason,
                 before_value=before,
                 after_value={

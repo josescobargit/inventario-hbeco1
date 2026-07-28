@@ -90,7 +90,7 @@ class PurchaseOrderSourceDocument(Base):
     )
     original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
     content_type: Mapped[str] = mapped_column(String(100), nullable=False)
-    content: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    content: Mapped[bytes | None] = mapped_column(LargeBinary)
     sha256: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     extraction_method: Mapped[str] = mapped_column(String(40), nullable=False)
     extracted_text: Mapped[str | None] = mapped_column(Text)
