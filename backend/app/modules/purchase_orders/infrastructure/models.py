@@ -67,6 +67,7 @@ class PurchaseOrderLine(Base):
     product_id: Mapped[uuid.UUID] = mapped_column(
         Uuid, ForeignKey("products.id", ondelete="RESTRICT"), nullable=False
     )
+    sort_order: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     ordered_quantity: Mapped[int] = mapped_column(BigInteger, nullable=False)
     original_quantity: Mapped[int | None] = mapped_column(BigInteger)
     original_unit: Mapped[str | None] = mapped_column(String(30))

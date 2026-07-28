@@ -1,6 +1,6 @@
 import { ChangeEvent, DragEvent, useState } from "react";
 
-import { apiRequest, apiUpload, apiUrl } from "../../api/client";
+import { ApiError, apiRequest, apiUpload, apiUrl } from "../../api/client";
 import {
   CustomerAlias, DocumentProductLine, MatchableProduct, normalizeProductText,
   parseDocumentProductLines, extractVisibleUnitTotal, parsePositionalTableRows,
@@ -40,6 +40,18 @@ interface DraftState extends PreviewDraft {
 }
 
 const accepted = ".pdf,.jpg,.jpeg,.png,.webp";
+const maxDocumentBytes = 15 * 1024 * 1024;
+export const purchaseOrderPreviewPath = "/purchase-orders/imports/preview";
+
+function documentProcessingError(caught: unknown): string {
+  if (caught instanceof ApiError) {
+    if (caught.status === 401) return "No se pudo procesar el documento. Detalle: tu sesión expiró; inicia sesión nuevamente.";
+    if (caught.status === 404) return "No se pudo procesar el documento. Detalle: el servicio de lectura no está disponible (la ruta de importación respondió 404).";
+    if (caught.status >= 500) return "No se pudo procesar el documento. Detalle: el servicio de lectura tuvo un error interno.";
+    return `No se pudo procesar el documento. Detalle: ${caught.message}`;
+  }
+  return "No se pudo procesar el documento. Detalle: no fue posible conectar con el servicio de lectura.";
+}
 
 export function PurchaseOrderDocumentImport({
   products, orders, onCreated, onCancel,
@@ -60,11 +72,14 @@ export function PurchaseOrderDocumentImport({
   const [error, setError] = useState<string | null>(null);
 
   const addFiles = (incoming: File[]) => {
-    const allowed = incoming.filter((file) =>
-      ["application/pdf", "image/jpeg", "image/png", "image/webp"].includes(file.type),
-    );
+    const supported = ["application/pdf", "image/jpeg", "image/png", "image/webp"];
+    const allowed = incoming.filter((file) => supported.includes(file.type) && file.size <= maxDocumentBytes);
     setFiles((current) => [...current, ...allowed].slice(0, 10));
-    if (allowed.length !== incoming.length) setError("Se ignoraron archivos con formato no admitido.");
+    const oversized = incoming.filter((file) => file.size > maxDocumentBytes);
+    const invalid = incoming.filter((file) => !supported.includes(file.type));
+    if (oversized.length) setError(`${oversized[0]!.name}: supera el límite de 15 MB.`);
+    else if (invalid.length) setError(`${invalid[0]!.name}: usa PDF, JPG, JPEG, PNG o WEBP.`);
+    else setError(null);
   };
   const chooseFiles = (event: ChangeEvent<HTMLInputElement>) => addFiles([...event.target.files ?? []]);
   const drop = (event: DragEvent<HTMLDivElement>) => {
@@ -76,7 +91,7 @@ export function PurchaseOrderDocumentImport({
     files.forEach((file) => data.append("files", file));
     if (pastedText.trim()) data.append("pasted_text", pastedText);
     try {
-      const response = await apiUpload<{ drafts: PreviewDraft[] }>("/purchase-orders/imports/preview", data);
+      const response = await apiUpload<{ drafts: PreviewDraft[] }>(purchaseOrderPreviewPath, data);
       const recognized = await Promise.all(response.drafts.map(async (draft, index) => {
         const chainName = draft.header.chain_name ?? "";
         let aliases: CustomerAlias[] = [];
@@ -105,7 +120,7 @@ export function PurchaseOrderDocumentImport({
       }));
       setDrafts(recognized);
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "No pudimos procesar los documentos.");
+      setError(documentProcessingError(caught));
     } finally {
       setProcessing(false);
     }
@@ -279,7 +294,7 @@ export function PurchaseOrderDocumentImport({
 
   if (!drafts.length) return <section className="order-form document-import">
     <div className="form-section-title"><div><h2>Crear OC desde PDF, imagen o pedido</h2><p>El documento se procesa localmente y siempre genera un borrador para revisión.</p></div></div>
-    {error && <div className="message error" role="alert">{error}</div>}
+    {error && <div className="message error document-reader-error" role="alert"><span>{error}</span>{(files.length > 0 || pastedText.trim()) && <button type="button" disabled={processing} onClick={process}>Reintentar</button>}</div>}
     <div className={`document-dropzone ${dragging ? "dragging" : ""}`} onDragOver={(event) => { event.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={drop}>
       <strong>Arrastra PDF, JPG, PNG o WEBP</strong><span>Hasta 10 archivos de 15 MB cada uno</span>
       <label className="secondary-button">Seleccionar archivos<input hidden multiple type="file" accept={accepted} onChange={chooseFiles} /></label>

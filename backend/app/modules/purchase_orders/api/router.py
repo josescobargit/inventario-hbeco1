@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.modules.audit.infrastructure.models import AuditLog
 from app.modules.auth.api.dependencies import CurrentUser
+from app.modules.auth.infrastructure.models import User
 from app.modules.catalog.infrastructure.models import Product
 from app.modules.deliveries.infrastructure.models import Delivery, DeliveryLine
 from app.modules.dispatches.infrastructure.models import Dispatch, DispatchLine
@@ -46,6 +47,7 @@ from app.modules.purchase_orders.domain.customer_profiles import (
     aliases_for_chain,
     chain_evidence_aliases,
 )
+from app.modules.reservations.infrastructure.models import Reservation, ReservationLine
 from app.modules.returns.infrastructure.models import Return, ReturnLine
 
 
@@ -83,6 +85,17 @@ class OrderInput(BaseModel):
     confirmed_aliases: list[ConfirmedAliasInput] = []
 
 
+class OrderUpdateInput(BaseModel):
+    chain_name: str = Field(min_length=2, max_length=160)
+    customer_name: str | None = Field(default=None, max_length=160)
+    order_number: str = Field(min_length=1, max_length=100)
+    order_date: date | None = None
+    destination: str | None = Field(default=None, max_length=200)
+    notes: str | None = Field(default=None, max_length=2000)
+    lines: list[LineInput] = Field(min_length=1)
+    reason: str | None = Field(default=None, max_length=1000)
+
+
 router = APIRouter(prefix="/purchase-orders", tags=["Órdenes de compra"])
 
 CHAIN_ALIASES = {
@@ -99,6 +112,70 @@ def canonical_chain_name(value: str) -> str:
     """Return the user-facing identity used for new purchase orders."""
     clean = " ".join(value.strip().split())
     return CHAIN_ALIASES.get(normalize_identity(clean), clean)
+
+
+def validate_line_conversion(line: LineInput) -> None:
+    if not line.conversion_confirmed:
+        raise HTTPException(
+            status_code=422,
+            detail="Confirma todas las cantidades y conversiones antes de guardar la OC.",
+        )
+    if line.original_unit == "boxes":
+        if not line.original_quantity or not line.units_per_box:
+            raise HTTPException(
+                status_code=422,
+                detail="Una cantidad en cajas requiere cantidad original y UxC.",
+            )
+        if line.quantity != line.original_quantity * line.units_per_box:
+            raise HTTPException(
+                status_code=422,
+                detail="Las unidades calculadas no coinciden con Cajas × UxC.",
+            )
+
+
+def validate_traceable_line_change(
+    sku: str,
+    quantity: int | None,
+    *,
+    invoiced: int,
+    dispatched: int,
+    delivered: int,
+    reserved: int,
+) -> None:
+    operated = max(invoiced, dispatched, delivered, reserved)
+    if quantity is None and operated:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"No puedes eliminar {sku} porque ya tiene operaciones relacionadas "
+                f"({operated} unidades)."
+            ),
+        )
+    if quantity is None:
+        return
+    limits = [
+        ("facturaron", invoiced),
+        ("despacharon", dispatched),
+        ("entregaron", delivered),
+        ("reservaron", reserved),
+    ]
+    limiting_action, minimum = max(limits, key=lambda item: item[1])
+    if quantity < minimum:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"No puedes reducir {sku} a {quantity} unidades porque ya se "
+                f"{limiting_action} {minimum}."
+            ),
+        )
+
+
+def audit_value(value):
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {key: audit_value(item) for key, item in value.items()}
+    return value
 
 
 def fulfillment_status(
@@ -138,7 +215,7 @@ def detail(db: Session, order: PurchaseOrder) -> dict:
             PurchaseOrderLine.purchase_order_id == order.id,
             Warehouse.code == "principal",
         )
-        .order_by(Product.sku)
+        .order_by(PurchaseOrderLine.sort_order, Product.sku)
     ).all()
     lines = []
     for line, product, stored in rows:
@@ -218,6 +295,7 @@ def detail(db: Session, order: PurchaseOrder) -> dict:
             {
                 "sku": product.sku,
                 "product_name": product.name,
+                "sort_order": line.sort_order,
                 "ordered_quantity": line.ordered_quantity,
                 "invoiced_quantity": invoiced,
                 "dispatched_quantity": dispatched,
@@ -260,6 +338,82 @@ def detail(db: Session, order: PurchaseOrder) -> dict:
                 "source_description": line.source_description,
             }
         )
+    source_documents = [
+        {
+            "token": document.upload_token,
+            "filename": document.original_filename,
+            "content_type": document.content_type,
+            "extraction_method": document.extraction_method,
+            "page_count": document.page_count,
+            "size_bytes": len(document.content),
+            "uploaded_at": document.created_at,
+            "uploaded_by_user_id": document.created_by_user_id,
+            "sha256": document.sha256,
+        }
+        for document in db.scalars(
+            select(PurchaseOrderSourceDocument)
+            .join(
+                PurchaseOrderDocumentLink,
+                PurchaseOrderDocumentLink.document_id == PurchaseOrderSourceDocument.id,
+            )
+            .where(PurchaseOrderDocumentLink.purchase_order_id == order.id)
+            .order_by(PurchaseOrderSourceDocument.created_at)
+        )
+    ]
+    related_invoices = [
+        {
+            "id": invoice.id,
+            "invoice_number": invoice.invoice_number,
+            "administrative_status": invoice.administrative_status,
+            "dispatch_status": invoice.dispatch_status,
+            "delivery_status": invoice.delivery_status,
+            "dispatches": [
+                {"id": item.id, "dispatched_at": item.dispatched_at}
+                for item in db.scalars(
+                    select(Dispatch)
+                    .where(Dispatch.invoice_id == invoice.id)
+                    .order_by(Dispatch.dispatched_at)
+                )
+            ],
+            "deliveries": [
+                {"id": item.id, "delivered_at": item.delivered_at}
+                for item in db.scalars(
+                    select(Delivery)
+                    .where(Delivery.invoice_id == invoice.id)
+                    .order_by(Delivery.delivered_at)
+                )
+            ],
+        }
+        for invoice in db.scalars(
+            select(Invoice)
+            .where(Invoice.purchase_order_id == order.id)
+            .order_by(Invoice.invoice_date, Invoice.invoice_number)
+        )
+    ]
+    related_reservations = [
+        {
+            "id": reservation.id,
+            "status": reservation.status,
+            "reason": reservation.reason,
+        }
+        for reservation in db.scalars(
+            select(Reservation)
+            .where(
+                Reservation.purchase_order_reference == order.order_number,
+                Reservation.status.in_(["active", "used"]),
+            )
+            .order_by(Reservation.created_at)
+        )
+    ]
+    manually_modified = bool(
+        db.scalar(
+            select(AuditLog.id).where(
+                AuditLog.entity_type == "purchase_order",
+                AuditLog.entity_id == str(order.id),
+                AuditLog.action == "purchase_order_updated",
+            )
+        )
+    )
     return {
         "id": order.id,
         "chain_name": order.chain_name,
@@ -272,59 +426,11 @@ def detail(db: Session, order: PurchaseOrder) -> dict:
         "secondary_reference": order.secondary_reference,
         "local_name": order.local_name,
         "lines": lines,
-        "source_documents": [
-            {
-                "token": document.upload_token,
-                "filename": document.original_filename,
-                "content_type": document.content_type,
-                "extraction_method": document.extraction_method,
-                "page_count": document.page_count,
-                "size_bytes": len(document.content),
-                "uploaded_at": document.created_at,
-                "uploaded_by_user_id": document.created_by_user_id,
-                "sha256": document.sha256,
-            }
-            for document in db.scalars(
-                select(PurchaseOrderSourceDocument)
-                .join(
-                    PurchaseOrderDocumentLink,
-                    PurchaseOrderDocumentLink.document_id
-                    == PurchaseOrderSourceDocument.id,
-                )
-                .where(PurchaseOrderDocumentLink.purchase_order_id == order.id)
-                .order_by(PurchaseOrderSourceDocument.created_at)
-            )
-        ],
-        "related_invoices": [
-            {
-                "id": invoice.id,
-                "invoice_number": invoice.invoice_number,
-                "administrative_status": invoice.administrative_status,
-                "dispatch_status": invoice.dispatch_status,
-                "delivery_status": invoice.delivery_status,
-                "dispatches": [
-                    {"id": item.id, "dispatched_at": item.dispatched_at}
-                    for item in db.scalars(
-                        select(Dispatch)
-                        .where(Dispatch.invoice_id == invoice.id)
-                        .order_by(Dispatch.dispatched_at)
-                    )
-                ],
-                "deliveries": [
-                    {"id": item.id, "delivered_at": item.delivered_at}
-                    for item in db.scalars(
-                        select(Delivery)
-                        .where(Delivery.invoice_id == invoice.id)
-                        .order_by(Delivery.delivered_at)
-                    )
-                ],
-            }
-            for invoice in db.scalars(
-                select(Invoice)
-                .where(Invoice.purchase_order_id == order.id)
-                .order_by(Invoice.invoice_date, Invoice.invoice_number)
-            )
-        ],
+        "source_documents": source_documents,
+        "related_invoices": related_invoices,
+        "related_reservations": related_reservations,
+        "has_related_operations": bool(related_invoices or related_reservations),
+        "manually_modified": manually_modified,
     }
 
 
@@ -571,28 +677,408 @@ def get_order(
     return detail(db, order)
 
 
+def related_product_amounts(
+    db: Session, order: PurchaseOrder, product_id: uuid.UUID
+) -> dict[str, int]:
+    invoiced = db.scalar(
+        select(func.coalesce(func.sum(InvoiceLine.quantity), 0))
+        .join(Invoice, Invoice.id == InvoiceLine.invoice_id)
+        .where(
+            Invoice.purchase_order_id == order.id,
+            Invoice.administrative_status == "confirmed",
+            InvoiceLine.product_id == product_id,
+        )
+    )
+    dispatched = db.scalar(
+        select(func.coalesce(func.sum(DispatchLine.dispatched_quantity), 0))
+        .select_from(DispatchLine)
+        .join(Dispatch, Dispatch.id == DispatchLine.dispatch_id)
+        .join(InvoiceLine, InvoiceLine.id == DispatchLine.invoice_line_id)
+        .join(Invoice, Invoice.id == InvoiceLine.invoice_id)
+        .where(
+            Invoice.purchase_order_id == order.id,
+            Invoice.administrative_status == "confirmed",
+            InvoiceLine.product_id == product_id,
+        )
+    )
+    delivered = db.scalar(
+        select(func.coalesce(func.sum(DeliveryLine.delivered_quantity), 0))
+        .select_from(DeliveryLine)
+        .join(Delivery, Delivery.id == DeliveryLine.delivery_id)
+        .join(InvoiceLine, InvoiceLine.id == DeliveryLine.invoice_line_id)
+        .join(Invoice, Invoice.id == InvoiceLine.invoice_id)
+        .where(
+            Invoice.purchase_order_id == order.id,
+            Invoice.administrative_status == "confirmed",
+            InvoiceLine.product_id == product_id,
+        )
+    )
+    reserved = db.scalar(
+        select(func.coalesce(func.sum(ReservationLine.quantity), 0))
+        .select_from(ReservationLine)
+        .join(Reservation, Reservation.id == ReservationLine.reservation_id)
+        .where(
+            Reservation.purchase_order_reference == order.order_number,
+            Reservation.status.in_(["active", "used"]),
+            ReservationLine.product_id == product_id,
+        )
+    )
+    return {
+        "invoiced": int(invoiced or 0),
+        "dispatched": int(dispatched or 0),
+        "delivered": int(delivered or 0),
+        "reserved": int(reserved or 0),
+    }
+
+
+@router.get("/{order_id}/history")
+def purchase_order_history(
+    order_id: uuid.UUID,
+    _user: CurrentUser,
+    db: Annotated[Session, Depends(get_db)],
+):
+    if db.get(PurchaseOrder, order_id) is None:
+        raise HTTPException(
+            status_code=404, detail="No encontramos la orden de compra."
+        )
+    return [
+        {
+            "id": item.id,
+            "occurred_at": item.occurred_at,
+            "actor": actor.full_name if actor else "Sistema",
+            "field": (item.new_value or {}).get("field"),
+            "previous_value": (item.previous_value or {}).get("value"),
+            "new_value": (item.new_value or {}).get("value"),
+            "reason": item.reason,
+        }
+        for item, actor in db.execute(
+            select(AuditLog, User)
+            .outerjoin(User, User.id == AuditLog.actor_user_id)
+            .where(
+                AuditLog.entity_type == "purchase_order",
+                AuditLog.entity_id == str(order_id),
+                AuditLog.action == "purchase_order_updated",
+            )
+            .order_by(AuditLog.occurred_at.desc(), AuditLog.id.desc())
+        ).all()
+    ]
+
+
+@router.put("/{order_id}")
+def update_order(
+    order_id: uuid.UUID,
+    payload: OrderUpdateInput,
+    user: CurrentUser,
+    db: Annotated[Session, Depends(get_db)],
+):
+    order = db.scalar(
+        select(PurchaseOrder).where(PurchaseOrder.id == order_id).with_for_update()
+    )
+    if order is None:
+        raise HTTPException(
+            status_code=404, detail="No encontramos la orden de compra."
+        )
+    skus = [line.sku.strip().upper() for line in payload.lines]
+    if len(set(skus)) != len(skus):
+        raise HTTPException(status_code=422, detail="No repitas un SKU en la OC.")
+    for line in payload.lines:
+        validate_line_conversion(line)
+    products = {
+        product.sku: product
+        for product in db.scalars(select(Product).where(Product.sku.in_(skus))).all()
+    }
+    if set(skus) != set(products):
+        raise HTTPException(
+            status_code=422,
+            detail=f"SKU desconocidos: {', '.join(sorted(set(skus) - set(products)))}",
+        )
+    chain_name = canonical_chain_name(payload.chain_name)
+    normalized_chain = normalize_identity(chain_name)
+    duplicate = next(
+        (
+            existing
+            for existing in db.scalars(
+                select(PurchaseOrder).where(
+                    PurchaseOrder.id != order.id,
+                    func.lower(PurchaseOrder.order_number)
+                    == payload.order_number.strip().lower(),
+                )
+            )
+            if normalize_identity(existing.chain_name) == normalized_chain
+        ),
+        None,
+    )
+    if duplicate:
+        raise HTTPException(
+            status_code=409, detail="Esta cadena ya tiene una OC con ese número."
+        )
+
+    existing_rows = db.execute(
+        select(PurchaseOrderLine, Product)
+        .join(Product, Product.id == PurchaseOrderLine.product_id)
+        .where(PurchaseOrderLine.purchase_order_id == order.id)
+        .with_for_update(of=PurchaseOrderLine)
+    ).all()
+    existing_by_sku = {product.sku: line for line, product in existing_rows}
+    related_by_sku = {
+        sku: related_product_amounts(db, order, line.product_id)
+        for sku, line in existing_by_sku.items()
+    }
+    has_related_operations = any(
+        any(amounts.values()) for amounts in related_by_sku.values()
+    )
+    has_related_reservations = any(
+        amounts["reserved"] > 0 for amounts in related_by_sku.values()
+    )
+    if has_related_reservations and (
+        order.order_number != payload.order_number.strip()
+        or normalize_identity(order.chain_name) != normalized_chain
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "No puedes cambiar la cadena o el número mientras existan reservas "
+                "relacionadas. Libera o gestiona primero esas reservas."
+            ),
+        )
+
+    changes: list[tuple[str, object, object]] = []
+    header_values = [
+        ("Cadena", order.chain_name, chain_name),
+        ("Número de OC", order.order_number, payload.order_number.strip()),
+        ("Fecha", order.order_date, payload.order_date),
+        ("Destino", order.destination, payload.destination),
+        ("Observaciones", order.notes, payload.notes),
+    ]
+    changes.extend(
+        (field, previous, new)
+        for field, previous, new in header_values
+        if previous != new
+    )
+    incoming_by_sku = {
+        line.sku.strip().upper(): (position, line)
+        for position, line in enumerate(payload.lines)
+    }
+    for sku, existing_line in existing_by_sku.items():
+        incoming = incoming_by_sku.get(sku)
+        amounts = related_by_sku[sku]
+        validate_traceable_line_change(
+            sku,
+            incoming[1].quantity if incoming else None,
+            **amounts,
+        )
+        if incoming is None:
+            changes.append(
+                (f"Producto eliminado: {sku}", existing_line.ordered_quantity, None)
+            )
+            continue
+        position, line = incoming
+        if existing_line.ordered_quantity != line.quantity:
+            changes.append(
+                (
+                    f"Cantidad: {sku}",
+                    existing_line.ordered_quantity,
+                    line.quantity,
+                )
+            )
+        if (
+            existing_line.original_quantity,
+            existing_line.original_unit,
+            existing_line.units_per_box,
+        ) != (line.original_quantity, line.original_unit, line.units_per_box):
+            changes.append(
+                (
+                    f"Conversión: {sku}",
+                    {
+                        "cantidad": existing_line.original_quantity,
+                        "tipo": existing_line.original_unit,
+                        "uxc": existing_line.units_per_box,
+                    },
+                    {
+                        "cantidad": line.original_quantity,
+                        "tipo": line.original_unit,
+                        "uxc": line.units_per_box,
+                    },
+                )
+            )
+        if existing_line.sort_order != position:
+            changes.append(
+                (f"Posición: {sku}", existing_line.sort_order + 1, position + 1)
+            )
+    for sku, (_, line) in incoming_by_sku.items():
+        if sku not in existing_by_sku:
+            if not products[sku].is_active:
+                raise HTTPException(
+                    status_code=422, detail=f"{sku} no está activo en el catálogo."
+                )
+            changes.append((f"Producto agregado: {sku}", None, line.quantity))
+
+    if has_related_operations and changes and not (payload.reason or "").strip():
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Indica el motivo de la edición porque esta OC ya tiene operaciones "
+                "relacionadas."
+            ),
+        )
+
+    order.chain_name = chain_name
+    order.customer_name = payload.customer_name or chain_name
+    order.order_number = payload.order_number.strip()
+    order.order_date = payload.order_date
+    order.destination = payload.destination
+    order.notes = payload.notes
+    for sku, existing_line in existing_by_sku.items():
+        incoming = incoming_by_sku.get(sku)
+        if incoming is None:
+            db.delete(existing_line)
+            continue
+        position, line = incoming
+        existing_line.sort_order = position
+        existing_line.ordered_quantity = line.quantity
+        existing_line.original_quantity = line.original_quantity
+        existing_line.original_unit = line.original_unit
+        existing_line.units_per_box = line.units_per_box
+        existing_line.conversion_method = line.conversion_method
+        existing_line.conversion_confirmed = line.conversion_confirmed
+    for sku, (position, line) in incoming_by_sku.items():
+        if sku in existing_by_sku:
+            continue
+        db.add(
+            PurchaseOrderLine(
+                purchase_order_id=order.id,
+                product_id=products[sku].id,
+                sort_order=position,
+                ordered_quantity=line.quantity,
+                original_quantity=line.original_quantity,
+                original_unit=line.original_unit,
+                units_per_box=line.units_per_box,
+                conversion_method=line.conversion_method,
+                conversion_confirmed=line.conversion_confirmed,
+            )
+        )
+
+    total_invoiced = sum(amounts["invoiced"] for amounts in related_by_sku.values())
+    if order.status != "cancelled":
+        if total_invoiced == 0:
+            order.status = "open"
+        elif all(
+            related_by_sku.get(sku, {}).get("invoiced", 0) >= line.quantity
+            for sku, (_, line) in incoming_by_sku.items()
+        ):
+            order.status = "completed"
+        else:
+            order.status = "partially_invoiced"
+    for field, previous, new in changes:
+        db.add(
+            AuditLog(
+                actor_user_id=user.id,
+                action="purchase_order_updated",
+                entity_type="purchase_order",
+                entity_id=str(order.id),
+                reason=(payload.reason or "").strip() or None,
+                previous_value={"field": field, "value": audit_value(previous)},
+                new_value={"field": field, "value": audit_value(new)},
+            )
+        )
+    try:
+        db.commit()
+    except IntegrityError as error:
+        db.rollback()
+        raise HTTPException(
+            status_code=409, detail="Esta cadena ya tiene una OC con ese número."
+        ) from error
+    response = detail(db, order)
+    response["change_summary"] = {
+        "number_changed": any(field == "Número de OC" for field, _, _ in changes),
+        "destination_changed": any(field == "Destino" for field, _, _ in changes),
+        "products_added": sum(
+            field.startswith("Producto agregado") for field, _, _ in changes
+        ),
+        "products_removed": sum(
+            field.startswith("Producto eliminado") for field, _, _ in changes
+        ),
+        "quantities_changed": sum(
+            field.startswith("Cantidad:") for field, _, _ in changes
+        ),
+    }
+    return response
+
+
+@router.post("/{order_id}/documents", status_code=201)
+async def attach_corrected_document(
+    order_id: uuid.UUID,
+    user: CurrentUser,
+    db: Annotated[Session, Depends(get_db)],
+    file: Annotated[UploadFile, File()],
+):
+    order = db.get(PurchaseOrder, order_id)
+    if order is None:
+        raise HTTPException(
+            status_code=404, detail="No encontramos la orden de compra."
+        )
+    content = await file.read(MAX_DOCUMENT_BYTES + 1)
+    content_type = (file.content_type or "").lower()
+    if content_type not in ALLOWED_DOCUMENT_TYPES - {"text/plain"}:
+        raise HTTPException(status_code=422, detail="Usa PDF, JPG, JPEG, PNG o WEBP.")
+    if len(content) > MAX_DOCUMENT_BYTES:
+        raise HTTPException(status_code=413, detail="El archivo supera 15 MB.")
+    digest = sha256(content).hexdigest()
+    duplicate = db.scalar(
+        select(PurchaseOrderSourceDocument.id)
+        .join(
+            PurchaseOrderDocumentLink,
+            PurchaseOrderDocumentLink.document_id == PurchaseOrderSourceDocument.id,
+        )
+        .where(
+            PurchaseOrderDocumentLink.purchase_order_id == order.id,
+            PurchaseOrderSourceDocument.sha256 == digest,
+        )
+    )
+    if duplicate:
+        raise HTTPException(
+            status_code=409, detail="Este documento ya está adjunto a la OC."
+        )
+    extracted = extract_document(content, content_type, file.filename or "documento")
+    document = PurchaseOrderSourceDocument(
+        original_filename=file.filename or "documento-corregido",
+        content_type=content_type,
+        content=content,
+        sha256=digest,
+        extraction_method=extracted.method,
+        extracted_text=extracted.text,
+        page_count=extracted.page_count,
+        created_by_user_id=user.id,
+    )
+    db.add(document)
+    db.flush()
+    db.add(
+        PurchaseOrderDocumentLink(purchase_order_id=order.id, document_id=document.id)
+    )
+    db.add(
+        AuditLog(
+            actor_user_id=user.id,
+            action="purchase_order_updated",
+            entity_type="purchase_order",
+            entity_id=str(order.id),
+            previous_value={"field": "Documento corregido", "value": None},
+            new_value={
+                "field": "Documento corregido",
+                "value": document.original_filename,
+            },
+        )
+    )
+    db.commit()
+    return detail(db, order)
+
+
 @router.post("", status_code=201)
 def create_order(
     payload: OrderInput, user: CurrentUser, db: Annotated[Session, Depends(get_db)]
 ):
     skus = [line.sku.strip().upper() for line in payload.lines]
     for line in payload.lines:
-        if not line.conversion_confirmed:
-            raise HTTPException(
-                status_code=422,
-                detail="Confirma todas las cantidades y conversiones antes de crear la OC.",
-            )
-        if line.original_unit == "boxes":
-            if not line.original_quantity or not line.units_per_box:
-                raise HTTPException(
-                    status_code=422,
-                    detail="Una cantidad en cajas requiere cantidad original y UxC.",
-                )
-            if line.quantity != line.original_quantity * line.units_per_box:
-                raise HTTPException(
-                    status_code=422,
-                    detail="Las unidades calculadas no coinciden con Cajas × UxC.",
-                )
+        validate_line_conversion(line)
     if len(set(skus)) != len(skus):
         raise HTTPException(status_code=422, detail="No repitas un SKU en la OC.")
     products = {
@@ -672,11 +1158,12 @@ def create_order(
     )
     db.add(order)
     db.flush()
-    for line in payload.lines:
+    for sort_order, line in enumerate(payload.lines):
         db.add(
             PurchaseOrderLine(
                 purchase_order_id=order.id,
                 product_id=products[line.sku.strip().upper()].id,
+                sort_order=sort_order,
                 ordered_quantity=line.quantity,
                 original_quantity=line.original_quantity,
                 original_unit=line.original_unit,

@@ -1,5 +1,6 @@
 import io
 import os
+import re
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,8 +8,12 @@ from types import SimpleNamespace
 import fitz
 import pytest
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 from PIL import Image
 
+from app.main import app
+from app.core.database import get_db
+from app.modules.auth.api.dependencies import get_current_user
 from app.modules.purchase_orders.domain import document_extraction
 from app.modules.purchase_orders.api.router import purchase_order_document_content
 
@@ -394,3 +399,53 @@ def test_supplied_purchase_orders_total_exactly_43_product_lines() -> None:
 
     assert extracted_counts == [4, 4, 6, 4, 9, 16]
     assert sum(extracted_counts) == 43
+
+
+def test_frontend_purchase_order_import_route_matches_backend_contract() -> None:
+    frontend_source = (
+        Path(__file__).parents[4]
+        / "frontend/src/features/purchase-orders/PurchaseOrderDocumentImport.tsx"
+    ).read_text(encoding="utf-8")
+    route = re.search(r'purchaseOrderPreviewPath\s*=\s*"([^"]+)"', frontend_source)
+    assert route is not None
+    full_path = f"/api/v1{route.group(1)}"
+    assert full_path in app.openapi()["paths"]
+    assert "post" in app.openapi()["paths"][full_path]
+
+
+def test_purchase_order_import_route_exists_for_unauthenticated_user() -> None:
+    response = TestClient(app).post(
+        "/api/v1/purchase-orders/imports/preview",
+        files={"files": ("orden.pdf", b"%PDF-1.7", "application/pdf")},
+    )
+    assert response.status_code == 401
+    assert response.status_code != 404
+
+
+@pytest.mark.parametrize(
+    ("filename", "content_type", "content", "expected_status"),
+    [
+        (
+            "orden.docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            b"invalid",
+            422,
+        ),
+        ("grande.pdf", "application/pdf", b"x" * (15 * 1024 * 1024 + 1), 413),
+    ],
+)
+def test_purchase_order_import_endpoint_validates_file_before_extraction(
+    filename: str, content_type: str, content: bytes, expected_status: int
+) -> None:
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
+        id=uuid.uuid4()
+    )
+    app.dependency_overrides[get_db] = lambda: SimpleNamespace()
+    try:
+        response = TestClient(app).post(
+            "/api/v1/purchase-orders/imports/preview",
+            files={"files": (filename, content, content_type)},
+        )
+    finally:
+        app.dependency_overrides.clear()
+    assert response.status_code == expected_status

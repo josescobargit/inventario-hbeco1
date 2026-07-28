@@ -21,6 +21,7 @@ ACTION_LABELS = {
     "login_failed": "Inicio fallido",
     "logout": "Cierre de sesión",
     "purchase_order_created": "OC registrada",
+    "purchase_order_updated": "OC actualizada",
     "invoice_registered": "Factura registrada",
     "dispatch_confirmed": "Despacho confirmado",
     "delivery_registered": "Entrega registrada",
