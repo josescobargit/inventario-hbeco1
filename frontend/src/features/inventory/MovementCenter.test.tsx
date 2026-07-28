@@ -34,7 +34,7 @@ describe("MovementCenter", () => {
 
     expect(await screen.findByRole("heading", { name: "Movimientos" })).toBeVisible();
     expect((await screen.findAllByText("Salida general")).length).toBeGreaterThan(0);
-    expect(screen.getAllByText("SKU-001").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("SKU: SKU-001").length).toBeGreaterThan(0);
     expect(screen.getAllByText("-2").length).toBeGreaterThan(0);
     expect(screen.getAllByText("op-1").length).toBeGreaterThan(0);
     expect(screen.getByLabelText("Detalle del movimiento")).toHaveTextContent("Antes");

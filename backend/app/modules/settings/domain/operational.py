@@ -6,7 +6,7 @@ from app.modules.settings.infrastructure.models import AppSetting
 
 
 OPERATIONAL_KEY = "operational"
-DEFAULT_CHAINS = ["Gerardo Ortiz", "Favorita", "Rosado", "Danec", "Tía"]
+DEFAULT_CHAINS = ["Gerardo Ortiz", "Favorita", "Rosado", "Danec", "Tía", "TUTI"]
 DEFAULT_OPERATIONAL_SETTINGS: dict[str, Any] = {
     "warehouse_name": "Bodega principal",
     "low_stock_threshold_mode": "boxes",

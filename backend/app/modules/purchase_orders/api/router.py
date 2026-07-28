@@ -34,6 +34,7 @@ from app.modules.purchase_orders.infrastructure.models import (
 )
 from app.modules.purchase_orders.domain.document_extraction import (
     classify_document,
+    expected_product_count,
     extraction_signals,
     extract_document,
     normalize_identity,
@@ -83,6 +84,21 @@ class OrderInput(BaseModel):
 
 
 router = APIRouter(prefix="/purchase-orders", tags=["Órdenes de compra"])
+
+CHAIN_ALIASES = {
+    "TUTI": "TUTI",
+    "TIENDAS TUTI": "TUTI",
+    "TIA": "Tía",
+    "TIENDAS TIA": "Tía",
+    "EL ROSADO": "Rosado",
+    "CORPORACION EL ROSADO": "Rosado",
+}
+
+
+def canonical_chain_name(value: str) -> str:
+    """Return the user-facing identity used for new purchase orders."""
+    clean = " ".join(value.strip().split())
+    return CHAIN_ALIASES.get(normalize_identity(clean), clean)
 
 
 def fulfillment_status(
@@ -195,7 +211,9 @@ def detail(db: Session, order: PurchaseOrder) -> dict:
             stored.invoiced_not_dispatched,
             stored.blocked_by_incident,
         )
-        suggested = max(0, min(line.ordered_quantity, position.available_to_invoice))
+        pending = max(0, line.ordered_quantity - invoiced)
+        suggested = max(0, min(pending, position.available_to_invoice))
+        shortage = max(0, pending - position.available_to_invoice)
         lines.append(
             {
                 "sku": product.sku,
@@ -217,13 +235,20 @@ def detail(db: Session, order: PurchaseOrder) -> dict:
                     has_incident,
                 ),
                 "has_incident": has_incident,
-                "remaining_quantity": max(0, line.ordered_quantity - invoiced),
+                "remaining_quantity": pending,
                 "available": position.available_to_invoice,
-                "suggested_to_invoice": max(
-                    0, min(line.ordered_quantity - invoiced, suggested)
+                "suggested_to_invoice": suggested,
+                "shortage": shortage,
+                "complete": pending == 0 or shortage == 0,
+                "billing_result": (
+                    "Completamente facturada"
+                    if pending == 0
+                    else "Lista para facturar completa"
+                    if shortage == 0
+                    else "Facturable parcialmente"
+                    if suggested > 0
+                    else "Sin inventario"
                 ),
-                "shortage": line.ordered_quantity - suggested,
-                "complete": suggested == line.ordered_quantity,
                 "original_quantity": line.original_quantity,
                 "original_unit": line.original_unit,
                 "units_per_box": line.units_per_box,
@@ -361,6 +386,7 @@ async def preview_purchase_order_documents(
                 page_count = 1
                 warnings = ()
                 table_rows = ()
+                expected_count = expected_product_count(extracted_text, table_rows)
             else:
                 extracted = extract_document(content, content_type, filename)
                 extracted_text = extracted.text
@@ -368,6 +394,7 @@ async def preview_purchase_order_documents(
                 page_count = extracted.page_count
                 warnings = extracted.warnings
                 table_rows = extracted.table_rows
+                expected_count = extracted.expected_product_count
         except (RuntimeError, ValueError, OSError) as error:
             raise HTTPException(
                 status_code=422, detail=f"{filename}: {error}"
@@ -429,6 +456,11 @@ async def preview_purchase_order_documents(
                     "classification": classification,
                     "signals": extraction_signals(part),
                     "table_rows": list(table_rows) if len(parts) <= 1 else [],
+                    "expected_product_count": (
+                        expected_count
+                        if len(parts) <= 1
+                        else expected_product_count(part, [])
+                    ),
                     "warnings": preview_warnings,
                     "separation_needs_review": len(parts) > 1,
                 }
@@ -608,9 +640,28 @@ def create_order(
         raise HTTPException(
             status_code=422, detail="Un alias confirmado apunta a un producto inválido."
         )
+    chain_name = canonical_chain_name(payload.chain_name)
+    normalized_chain = normalize_identity(chain_name)
+    duplicate = next(
+        (
+            existing
+            for existing in db.scalars(
+                select(PurchaseOrder).where(
+                    func.lower(PurchaseOrder.order_number)
+                    == payload.order_number.strip().lower()
+                )
+            )
+            if normalize_identity(existing.chain_name) == normalized_chain
+        ),
+        None,
+    )
+    if duplicate:
+        raise HTTPException(
+            status_code=409, detail="Esta cadena ya tiene una OC con ese número."
+        )
     order = PurchaseOrder(
-        chain_name=payload.chain_name.strip(),
-        customer_name=payload.customer_name,
+        chain_name=chain_name,
+        customer_name=chain_name,
         order_number=payload.order_number.strip(),
         order_date=payload.order_date,
         destination=payload.destination,
@@ -645,7 +696,6 @@ def create_order(
                 document_id=document.id,
             )
         )
-    normalized_chain = normalize_identity(order.chain_name)
     for alias_input in payload.confirmed_aliases:
         normalized_source = normalize_identity(alias_input.source_text)
         existing_alias = db.scalar(

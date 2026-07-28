@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 
 import { apiRequest } from "../../api/client";
+import { ProductIdentity } from "../inventory/ProductIdentity";
 
 interface ComparisonRow {
   chain_name: string | null;
@@ -121,7 +122,7 @@ export function ComparisonCenter() {
         <tbody>{rows.map((row, index) => <tr className={row.status !== "ok" ? "comparison-warning" : undefined} key={`${row.order_number ?? "sin-oc"}-${row.sku}-${index}`}>
           <td><strong>{row.order_number ?? SOURCE_LABELS[row.source_type] ?? "Sin OC"}</strong><span>{row.invoice_numbers.length ? row.invoice_numbers.join(", ") : "Sin factura"}</span><span>{dateLabel(row.order_date)}</span></td>
           <td>{row.chain_name ?? "—"}</td>
-          <td><strong>{row.sku}</strong><span>{row.product_name}</span></td>
+          <td><ProductIdentity name={row.product_name} sku={row.sku} /></td>
           <td>{row.ordered_quantity}</td>
           <td>{row.invoiced_quantity}</td>
           <td>{row.dispatched_quantity}</td>

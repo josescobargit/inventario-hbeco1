@@ -14,6 +14,7 @@ from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
 from app.modules.purchase_orders.domain.table_extraction import (
     extract_pdf_table_rows,
+    extract_visual_word_rows,
 )
 
 
@@ -69,6 +70,7 @@ class ExtractedDocument:
     page_count: int
     warnings: tuple[str, ...] = ()
     table_rows: tuple[dict, ...] = ()
+    expected_product_count: int | None = None
 
 
 def _candidate_product_rows(text: str) -> int:
@@ -210,7 +212,58 @@ def _ocr_with_vision(image: Image.Image) -> str:
         )
 
 
-def _ocr_image(image: Image.Image) -> tuple[str, str]:
+def _rapid_ocr(image: Image.Image) -> tuple[str, list[dict], tuple[int, int]]:
+    try:
+        import numpy as np
+        from rapidocr_onnxruntime import RapidOCR
+    except ImportError:
+        return "", [], image.size
+    result, _elapsed = RapidOCR()(np.asarray(image.convert("RGB")))
+    if not result:
+        return "", [], image.size
+    words = []
+    for box, text, _score in result:
+        x_values = [float(point[0]) for point in box]
+        y_values = [float(point[1]) for point in box]
+        words.append(
+            {
+                "x0": min(x_values),
+                "y0": min(y_values),
+                "x1": max(x_values),
+                "y1": max(y_values),
+                "text": str(text),
+            }
+        )
+    grouped: list[list[dict]] = []
+    for word in sorted(words, key=lambda item: (item["y0"], item["x0"])):
+        center_y = (word["y0"] + word["y1"]) / 2
+        row = next(
+            (
+                candidate
+                for candidate in reversed(grouped[-5:])
+                if abs(
+                    center_y
+                    - sum((item["y0"] + item["y1"]) / 2 for item in candidate)
+                    / len(candidate)
+                )
+                <= max(8, image.height / 120)
+            ),
+            None,
+        )
+        if row is None:
+            grouped.append([word])
+        else:
+            row.append(word)
+    text = "\n".join(
+        " ".join(item["text"] for item in sorted(row, key=lambda item: item["x0"]))
+        for row in grouped
+    )
+    return text, words, image.size
+
+
+def _ocr_image(
+    image: Image.Image,
+) -> tuple[str, str, list[dict], tuple[int, int]]:
     prepared = _prepare_image(image)
     if shutil.which("tesseract"):
         try:
@@ -222,12 +275,18 @@ def _ocr_image(image: Image.Image) -> tuple[str, str]:
                 prepared = prepared.rotate(rotation, expand=True)
         except (pytesseract.TesseractError, ValueError):
             pass
-        return pytesseract.image_to_string(
-            prepared, lang="spa+eng"
-        ), "ocr_tesseract_local"
+        return (
+            pytesseract.image_to_string(prepared, lang="spa+eng"),
+            "ocr_tesseract_local",
+            [],
+            prepared.size,
+        )
+    rapid_text, rapid_words, rapid_size = _rapid_ocr(prepared)
+    if rapid_text:
+        return rapid_text, "ocr_rapid_local", rapid_words, rapid_size
     vision_text = _ocr_with_vision(prepared)
     if vision_text:
-        return vision_text, "ocr_apple_vision_local"
+        return vision_text, "ocr_apple_vision_local", [], prepared.size
     raise RuntimeError(
         "No hay un motor OCR local disponible. Instala Tesseract o ejecuta en macOS con Vision."
     )
@@ -251,7 +310,7 @@ def extract_document(
             pixmap = page.get_pixmap(matrix=fitz.Matrix(2.5, 2.5), alpha=False)
             image = Image.open(io.BytesIO(pixmap.tobytes("png")))
             try:
-                text, method = _ocr_image(image)
+                text, method, ocr_words, ocr_size = _ocr_image(image)
             except RuntimeError:
                 if not direct_text:
                     raise
@@ -263,6 +322,24 @@ def extract_document(
                 )
                 continue
             combined = _merge_page_text(direct_text, text.strip())
+            if not table_rows and ocr_words:
+                scale_x = float(page.rect.width) / ocr_size[0]
+                scale_y = float(page.rect.height) / ocr_size[1]
+                scaled_words = [
+                    {
+                        "x0": word["x0"] * scale_x,
+                        "y0": word["y0"] * scale_y,
+                        "x1": word["x1"] * scale_x,
+                        "y1": word["y1"] * scale_y,
+                        "text": word["text"],
+                    }
+                    for word in ocr_words
+                ]
+                table_rows.extend(
+                    extract_visual_word_rows(
+                        scaled_words, float(page.rect.width), page_number + 1
+                    )
+                )
             pages.append(f"[[PAGE:{page_number + 1}]]\n{combined}")
             if direct_text:
                 methods.add("pdf_text")
@@ -278,12 +355,29 @@ def extract_document(
             page_count=len(pdf),
             warnings=tuple(warnings),
             table_rows=tuple(table_rows),
+            expected_product_count=expected_product_count(
+                "\n\n".join(pages), table_rows
+            ),
         )
     image = Image.open(io.BytesIO(content))
-    text, method = _ocr_image(image)
+    text, method, words, size = _ocr_image(image)
+    rows = extract_visual_word_rows(words, float(size[0]), 1) if words else []
     return ExtractedDocument(
-        text=f"[[PAGE:1]]\n{text.strip()}", method=method, page_count=1
+        text=f"[[PAGE:1]]\n{text.strip()}",
+        method=method,
+        page_count=1,
+        table_rows=tuple(rows),
+        expected_product_count=expected_product_count(text, rows),
     )
+
+
+def expected_product_count(text: str, table_rows: list[dict] | tuple[dict, ...]) -> int:
+    match = re.search(
+        r"\bTOTAL\s+(?:DE\s+)?(?:ITEMS?|PRODUCTOS?)\s*[:#-]?\s*(\d+)\b",
+        text,
+        re.IGNORECASE,
+    )
+    return int(match.group(1)) if match else len(table_rows)
 
 
 def split_purchase_orders(text: str) -> list[str]:
