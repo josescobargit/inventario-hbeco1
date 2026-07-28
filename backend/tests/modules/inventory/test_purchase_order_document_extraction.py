@@ -1,5 +1,7 @@
 import io
+import os
 import uuid
+from pathlib import Path
 from types import SimpleNamespace
 
 import fitz
@@ -98,7 +100,12 @@ def test_scanned_pdf_uses_local_ocr(monkeypatch) -> None:
     monkeypatch.setattr(
         document_extraction,
         "_ocr_image",
-        lambda _image: ("ORDEN DE COMPRA OC-200\n2 PRODUCTO", "ocr_test_local"),
+        lambda _image: (
+            "ORDEN DE COMPRA OC-200\n2 PRODUCTO",
+            "ocr_test_local",
+            [],
+            _image.size,
+        ),
     )
     result = document_extraction.extract_document(
         document.tobytes(), "application/pdf", "escaneada.pdf"
@@ -125,6 +132,8 @@ def test_photographed_image_is_processed_as_a_single_ocr_page(monkeypatch) -> No
             "PEDIDO: FOTO-10\nCOMPRADOR: Cadena Foto\n"
             "DESCRIPCION QTY\nPRODUCTO FOTOGRAFIADO 4 UN",
             "ocr_test_photo",
+            [],
+            _image.size,
         ),
     )
     result = document_extraction.extract_document(
@@ -167,6 +176,8 @@ def test_digital_text_with_only_corporate_content_triggers_hybrid_ocr(
         lambda _image: (
             "PO: NEW-900\nBUYER: Cadena Nueva\nSKU DESCRIPTION QTY\nABC Producto universal 7 EA",
             "ocr_test_local",
+            [],
+            _image.size,
         ),
     )
     result = document_extraction.extract_document(
@@ -317,3 +328,69 @@ def test_linked_document_response_preserves_pdf_headers_and_bytes() -> None:
         response.headers["content-disposition"] == 'inline; filename="OC cliente.pdf"'
     )
     assert response.headers["cache-control"].startswith("private")
+
+
+SUPPLIED_OC_DIRECTORY = Path(
+    os.environ.get("PURCHASE_ORDER_SAMPLE_DIR", Path.home() / "Downloads")
+)
+SUPPLIED_OC_CASES = [
+    ("OC 23 JUL ROSADO UIO .pdf", 4),
+    ("OC TIA 3000927171.pdf", 4),
+    ("OC 919979 - 21 JUL.pdf", 6),
+    ("OC 4500346780 - 23 JUL.PDF", 4),
+    ("pedidos_125167-2.pdf", 9),
+    ("AL193257.pdf", 16),
+]
+
+
+@pytest.mark.parametrize(("filename", "expected_lines"), SUPPLIED_OC_CASES)
+def test_each_supplied_purchase_order_has_exact_product_count(
+    filename: str, expected_lines: int
+) -> None:
+    path = SUPPLIED_OC_DIRECTORY / filename
+    if not path.exists():
+        pytest.skip(
+            "Set PURCHASE_ORDER_SAMPLE_DIR to run the supplied-document regression."
+        )
+
+    result = document_extraction.extract_document(
+        path.read_bytes(), "application/pdf", filename
+    )
+
+    assert result.expected_product_count == expected_lines
+    assert len(result.table_rows) == expected_lines
+    assert all(row["description"] for row in result.table_rows)
+    assert all(row["quantity"] > 0 for row in result.table_rows)
+    forbidden = (
+        "PROVEEDOR",
+        "DIRECCION",
+        "OBSERVACION",
+        "SUBTOTAL",
+        "TOTAL DE ITEMS",
+        "PRECIO UNITARIO",
+    )
+    assert not any(
+        term in row["description"].upper()
+        for row in result.table_rows
+        for term in forbidden
+    )
+
+
+def test_supplied_purchase_orders_total_exactly_43_product_lines() -> None:
+    paths = [SUPPLIED_OC_DIRECTORY / filename for filename, _ in SUPPLIED_OC_CASES]
+    if not all(path.exists() for path in paths):
+        pytest.skip(
+            "Set PURCHASE_ORDER_SAMPLE_DIR to run the supplied-document regression."
+        )
+
+    extracted_counts = [
+        len(
+            document_extraction.extract_document(
+                path.read_bytes(), "application/pdf", path.name
+            ).table_rows
+        )
+        for path in paths
+    ]
+
+    assert extracted_counts == [4, 4, 6, 4, 9, 16]
+    assert sum(extracted_counts) == 43

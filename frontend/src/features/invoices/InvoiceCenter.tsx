@@ -63,15 +63,25 @@ const formatDate = (value: string) => new Intl.DateTimeFormat("es-EC", { dateSty
 const formatMoney = (value: string | number | null) => value == null ? "—" : new Intl.NumberFormat("es-EC", { style: "currency", currency: "USD" }).format(Number(value));
 
 export function InvoiceCenter() {
+  const [prepared] = useState(() => {
+    const stored = sessionStorage.getItem("inventario.invoiceTemplate");
+    if (!stored) return { template: null as InvoiceTemplate | null, error: null as string | null };
+    sessionStorage.removeItem("inventario.invoiceTemplate");
+    try {
+      return { template: JSON.parse(stored) as InvoiceTemplate, error: null };
+    } catch {
+      return { template: null, error: "No pudimos recuperar la factura preparada desde la OC." };
+    }
+  });
   const [invoices, setInvoices] = useState<InvoiceSummary[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [trace, setTrace] = useState<Traceability | null>(null);
   const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(true);
   const [detailLoading, setDetailLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [showForm, setShowForm] = useState(false);
-  const [template, setTemplate] = useState<InvoiceTemplate | null>(null);
+  const [error, setError] = useState<string | null>(prepared.error);
+  const [showForm, setShowForm] = useState(Boolean(prepared.template));
+  const [template, setTemplate] = useState<InvoiceTemplate | null>(prepared.template);
   const [editing, setEditing] = useState(false);
   const [success, setSuccess] = useState<string | null>(null);
 

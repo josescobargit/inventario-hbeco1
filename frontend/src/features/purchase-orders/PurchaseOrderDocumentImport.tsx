@@ -27,6 +27,7 @@ interface PreviewDraft {
     quantity_structure: boolean; candidate_rows: number;
   };
   table_rows: PositionalTableRow[];
+  expected_product_count: number | null;
 }
 interface DraftState extends PreviewDraft {
   id: string; order_number: string; chain_name: string; order_date: string;
@@ -55,7 +56,7 @@ export function PurchaseOrderDocumentImport({
   const [dragging, setDragging] = useState(false);
   const [mobileView, setMobileView] = useState<"document" | "data">("data");
   const [selectedLineId, setSelectedLineId] = useState<string | null>(null);
-  const [pendingOnly, setPendingOnly] = useState(false);
+  const [lineFilter, setLineFilter] = useState<"all" | "recognized" | "not_found" | "missing" | "quantity">("all");
   const [error, setError] = useState<string | null>(null);
 
   const addFiles = (incoming: File[]) => {
@@ -204,6 +205,8 @@ export function PurchaseOrderDocumentImport({
     if (!draft.chain_name.trim()) errors.push("Cliente/Cadena obligatorio.");
     if (orders.some((order) => normalizeProductText(order.chain_name) === normalizeProductText(draft.chain_name) && order.order_number.trim() === draft.order_number.trim())) errors.push("Esta OC ya existe para la cadena.");
     if (!draft.lines.length) errors.push("Agrega por lo menos un producto.");
+    const missingLines = Math.max(0, (draft.expected_product_count ?? draft.lines.length) - draft.lines.length);
+    if (missingLines) errors.push(`Falta revisar ${missingLines} línea${missingLines === 1 ? "" : "s"} del documento.`);
     if (draft.lines.some((line) => !line.sku || !line.quantity || line.quantity <= 0)) errors.push("Hay productos no reconocidos o cantidades pendientes.");
     if (draft.lines.some((line) => !line.reviewed)) errors.push("Revisa las líneas de confianza media o baja.");
     if (!draft.classification.allowed_for_purchase_order) errors.push(draft.classification.message);
@@ -264,6 +267,15 @@ export function PurchaseOrderDocumentImport({
     ready: drafts.filter((draft) => !problems(draft).length).length,
     errors: drafts.filter((draft) => problems(draft).length).length,
   };
+  const missingLineCount = (draft: DraftState) =>
+    Math.max(0, (draft.expected_product_count ?? draft.lines.length) - draft.lines.length);
+  const visibleLines = (draft: DraftState) => draft.lines.filter((line) => {
+    if (lineFilter === "recognized") return Boolean(line.sku);
+    if (lineFilter === "not_found") return !line.sku;
+    if (lineFilter === "quantity") return !line.original_quantity || !line.calculated_units;
+    if (lineFilter === "missing") return false;
+    return true;
+  });
 
   if (!drafts.length) return <section className="order-form document-import">
     <div className="form-section-title"><div><h2>Crear OC desde PDF, imagen o pedido</h2><p>El documento se procesa localmente y siempre genera un borrador para revisión.</p></div></div>
@@ -296,39 +308,37 @@ export function PurchaseOrderDocumentImport({
       <div className="recognized-order">
         <header><span className={`status-pill ${draft.classification.allowed_for_purchase_order ? "available" : "blocked"}`}>{draft.classification.label}</span><span className={`status-pill ${problems(draft).length ? "low_stock" : "available"}`}>{draft.status === "created" ? "OC creada" : problems(draft).length ? "Requiere revisión" : "Lista para crear"}</span>{draft.visibleUnitTotal !== null && <small>Total visible: {draft.visibleUnitTotal} unidades</small>}</header>
         {!draft.classification.allowed_for_purchase_order && <div className="message error" role="alert">{draft.classification.message}</div>}
-        <div className="recognition-summary" aria-label="Resumen del reconocimiento">
-          <span><strong>{draft.extraction_method.replaceAll("_", " ")}</strong>Método</span>
-          <span><strong>{draft.page_count}</strong>Páginas</span>
-          <span><strong>{draft.lines.length}</strong>Filas detectadas</span>
-          <span><strong>{draft.lines.filter((line) => line.sku).length}</strong>Reconocidas</span>
-          <span><strong>{draft.lines.filter((line) => !line.sku || !line.quantity).length}</strong>Pendientes</span>
-          <span><strong>{[draft.order_number, draft.chain_name].filter((value) => !value.trim()).length}</strong>Campos de cabecera pendientes</span>
+        <div className="recognition-summary product-recognition-summary" aria-label="Resumen del reconocimiento">
+          <span><strong>{draft.expected_product_count ?? draft.lines.length}</strong>Productos esperados</span>
+          <span><strong>{draft.lines.length}</strong>Productos detectados</span>
+          <span><strong>{draft.lines.filter((line) => line.sku).length}</strong>Relacionados con el catálogo</span>
+          <span><strong>{draft.lines.filter((line) => !line.sku).length}</strong>No encontrados en el catálogo</span>
+          <span><strong>{missingLineCount(draft)}</strong>Líneas que no se pudieron extraer</span>
         </div>
+        {missingLineCount(draft) > 0 && <div className="message warning">El documento indica {draft.expected_product_count} productos, pero sólo se detectaron {draft.lines.length}. Falta revisar {missingLineCount(draft)} línea{missingLineCount(draft) === 1 ? "" : "s"}.</div>}
         {draft.warnings.map((warning) => <div className="message warning" key={warning}>{warning}</div>)}
         {draft.chainCandidates.length > 1 && !draft.chain_name && <div className="chain-candidates"><span>Se encontraron varias posibles cadenas. Confirma una:</span>{draft.chainCandidates.map((candidate) => <button type="button" key={candidate} onClick={() => patchDraft(draft.id, { chain_name: candidate, headerConfirmed: false })}>{candidate}</button>)}</div>}
         {draft.separation_needs_review && <label className="preview-confirm"><input type="checkbox" checked={draft.separationConfirmed} onChange={(event) => patchDraft(draft.id, { separationConfirmed: event.target.checked })} /><span>Confirmo que este bloque corresponde a una OC separada del mismo documento.</span></label>}
         <div className="form-grid compact">
           <label><span>Número de OC *</span><input value={draft.order_number} onChange={(event) => patchDraft(draft.id, { order_number: event.target.value, headerConfirmed: false })} /><small>Fuente: {draft.header.order_number_source?.replaceAll("_", " ") ?? "pendiente"}</small></label>
-          <label><span>Cliente/Cadena *</span><input value={draft.chain_name} onChange={(event) => patchDraft(draft.id, { chain_name: event.target.value, headerConfirmed: false })} /></label>
+          <label><span>Cadena *</span><input value={draft.chain_name} onChange={(event) => patchDraft(draft.id, { chain_name: event.target.value, headerConfirmed: false })} /></label>
           <label><span>Fecha</span><input type="date" value={draft.order_date} onChange={(event) => patchDraft(draft.id, { order_date: event.target.value })} /></label>
           <label><span>Destino</span><input value={draft.destination} onChange={(event) => patchDraft(draft.id, { destination: event.target.value })} /></label>
           <label><span>Referencia secundaria</span><input value={draft.secondaryReference} onChange={(event) => patchDraft(draft.id, { secondaryReference: event.target.value, headerConfirmed: false })} /></label>
           <label><span>Local</span><input value={draft.localName} onChange={(event) => patchDraft(draft.id, { localName: event.target.value })} /></label>
         </div>
-        <label className="preview-confirm"><input type="checkbox" checked={draft.headerConfirmed} disabled={!draft.classification.allowed_for_purchase_order || !draft.order_number.trim() || !draft.chain_name.trim()} onChange={(event) => patchDraft(draft.id, { headerConfirmed: event.target.checked })} /><span>Confirmo el número de OC y Cliente/Cadena propuestos.</span></label>
-        <div className="review-tools"><button type="button" className="text-button" onClick={() => loadCustomerAliases(draft)}>Aplicar perfil de la cadena</button><button type="button" className="text-button" onClick={() => reprocessDraft(draft)}>Reprocesar documento</button><button type="button" className="text-button" onClick={() => confirmAllRecognized(draft)}>Confirmar todos los reconocidos</button><label className="difference-filter"><input type="checkbox" checked={pendingOnly} onChange={(event) => setPendingOnly(event.target.checked)} />Sólo pendientes</label><button type="button" className="text-button" onClick={() => addLine(draft)}>+ Agregar producto faltante</button></div>
-        <div className="table-scroll detected-products-table"><table><thead><tr><th>#</th><th>Texto del PDF</th><th>Producto relacionado</th><th>Cajas/Unid.</th><th>UxC</th><th>Unidades</th><th>Estado</th><th>Confirmar</th><th /></tr></thead><tbody>{draft.lines.filter((line) => !pendingOnly || !line.sku || !line.reviewed || !line.conversion_confirmed).map((line, index) => <tr className={`${selectedLineId === line.id ? "selected-source-row" : ""} confidence-${line.confidence}`} key={line.id} onClick={() => setSelectedLineId(line.id)}>
-          <td><strong>{line.item_number ?? index + 1}</strong><small>Pág. {line.page}</small></td>
-          <td><strong>{line.description || "Producto agregado manualmente"}</strong><small>{[line.chain_code, line.supplier_reference].filter(Boolean).join(" · ") || line.raw}</small></td>
-          <td><select aria-label={`Producto fila ${index + 1}`} value={line.sku} onClick={(event) => event.stopPropagation()} onChange={(event) => confirmLineProduct(draft, line, event.target.value)}><option value="">Selecciona para corregir</option>{products.map((product) => <option key={product.id ?? product.sku} value={product.sku}>{product.sku} · {product.product_name}</option>)}</select></td>
+        <label className="preview-confirm"><input type="checkbox" checked={draft.headerConfirmed} disabled={!draft.classification.allowed_for_purchase_order || !draft.order_number.trim() || !draft.chain_name.trim()} onChange={(event) => patchDraft(draft.id, { headerConfirmed: event.target.checked })} /><span>Confirmo el número de OC y la cadena propuestos.</span></label>
+        <div className="review-tools"><button type="button" className="text-button" onClick={() => loadCustomerAliases(draft)}>Aplicar perfil de la cadena</button><button type="button" className="text-button" onClick={() => reprocessDraft(draft)}>Reintentar reconocimiento</button><button type="button" className="text-button" onClick={() => confirmAllRecognized(draft)}>Confirmar todos los reconocidos</button><button type="button" className="text-button" onClick={() => addLine(draft)}>+ Agregar producto faltante</button></div>
+        <div className="line-review-filters" role="group" aria-label="Filtrar líneas">{([["all", "Todos"], ["recognized", "Reconocidos"], ["not_found", "No encontrados"], ["missing", "Líneas faltantes"], ["quantity", "Cantidades pendientes"]] as const).map(([value, label]) => <button type="button" className={lineFilter === value ? "active" : ""} key={value} onClick={() => setLineFilter(value)}>{label}</button>)}</div>
+        {lineFilter === "missing" && <div className="missing-lines-panel">{missingLineCount(draft) ? <>Falta revisar {missingLineCount(draft)} línea{missingLineCount(draft) === 1 ? "" : "s"}. <button type="button" onClick={() => addLine(draft)}>Agregar producto faltante</button></> : "No faltan líneas por extraer."}</div>}
+        <div className="table-scroll detected-products-table compact-product-review"><table><thead><tr><th>Producto del documento</th><th>Producto del catálogo</th><th>Cantidad</th><th>UxC</th><th>Unidades</th><th>Estado</th></tr></thead><tbody>{visibleLines(draft).map((line, index) => <tr className={`${selectedLineId === line.id ? "selected-source-row" : ""} confidence-${line.confidence}`} key={line.id} onClick={() => setSelectedLineId(line.id)}>
+          <td><strong>{line.description || "Producto agregado manualmente"}</strong><small>{line.chain_code ? `Código: ${line.chain_code}` : ""}{line.supplier_reference ? ` · Referencia: ${line.supplier_reference}` : ""}</small>{line.bounds && <button className="text-button row-action" type="button" onClick={(event) => { event.stopPropagation(); setSelectedLineId(line.id); }}>Ver línea en el PDF</button>}</td>
+          <td><select aria-label={`Producto fila ${index + 1}`} value={line.sku} onClick={(event) => event.stopPropagation()} onChange={(event) => confirmLineProduct(draft, line, event.target.value)}><option value="">Corregir producto…</option>{products.map((product) => <option key={product.id ?? product.sku} value={product.sku}>{product.product_name} · SKU: {product.sku}</option>)}</select>{line.suggestions.length > 0 && <small>Posibles coincidencias: {line.suggestions.join(", ")}</small>}</td>
           <td><input aria-label={`Cantidad fila ${index + 1}`} type="number" min={1} value={line.original_quantity ?? ""} onClick={(event) => event.stopPropagation()} onChange={(event) => updateLine(draft.id, line.id, conversionPatch(line, { original_quantity: Number(event.target.value) || null }))} /><select aria-label={`Tipo fila ${index + 1}`} value={line.original_unit_type} onClick={(event) => event.stopPropagation()} onChange={(event) => updateLine(draft.id, line.id, conversionPatch(line, { original_unit_type: event.target.value as DocumentProductLine["original_unit_type"] }))}><option value="ambiguous">¿Tipo?</option><option value="boxes">Cajas</option><option value="units">Unidades</option></select></td>
           <td><input aria-label={`UxC fila ${index + 1}`} type="number" min={1} disabled={line.original_unit_type === "units"} value={line.units_per_box ?? ""} onClick={(event) => event.stopPropagation()} onChange={(event) => updateLine(draft.id, line.id, conversionPatch(line, { units_per_box: Number(event.target.value) || null }))} /></td>
           <td><strong>{line.calculated_units ?? "—"}</strong></td>
-          <td><span className={`fulfillment-status ${line.sku && line.reviewed && line.conversion_confirmed ? "delivered_complete" : "invoicing_partial"}`}>{!line.calculated_units ? "Cantidad pendiente" : !line.sku ? "No reconocido" : !line.reviewed ? "Confirmar producto" : !line.conversion_confirmed ? "Confirmar cantidad" : "Reconocido"}</span></td>
-          <td><input aria-label={`Confirmar fila ${index + 1}`} type="checkbox" checked={line.reviewed && line.conversion_confirmed} disabled={!line.sku || !line.original_quantity || !line.calculated_units || (line.original_unit_type === "boxes" && !line.units_per_box)} onClick={(event) => event.stopPropagation()} onChange={(event) => updateLine(draft.id, line.id, { reviewed: event.target.checked, conversion_confirmed: event.target.checked })} /></td>
-          <td><button className="danger-link" type="button" onClick={(event) => { event.stopPropagation(); patchDraft(draft.id, { lines: draft.lines.filter((item) => item.id !== line.id) }); }}>Eliminar</button></td>
-        </tr>)}</tbody></table>{draft.lines.filter((line) => !pendingOnly || !line.sku || !line.reviewed || !line.conversion_confirmed).length === 0 && <div className="table-message">No hay productos pendientes.</div>}</div>
-        <details className="detected-full-text"><summary>Ver texto completo detectado</summary><pre>{draft.text}</pre></details>
+          <td><span className={`fulfillment-status ${line.sku && line.reviewed && line.conversion_confirmed ? "delivered_complete" : "invoicing_partial"}`}>{!line.calculated_units ? "Cantidad pendiente" : !line.sku ? "No encontrado en el catálogo" : !line.reviewed ? "Producto reconocido · confirmar" : !line.conversion_confirmed ? "Cantidad pendiente de confirmar" : "Producto reconocido"}</span><label className="inline-confirm"><input aria-label={`Confirmar fila ${index + 1}`} type="checkbox" checked={line.reviewed && line.conversion_confirmed} disabled={!line.sku || !line.original_quantity || !line.calculated_units || (line.original_unit_type === "boxes" && !line.units_per_box)} onClick={(event) => event.stopPropagation()} onChange={(event) => updateLine(draft.id, line.id, { reviewed: event.target.checked, conversion_confirmed: event.target.checked })} /> Confirmar</label><button className="danger-link" type="button" onClick={(event) => { event.stopPropagation(); patchDraft(draft.id, { lines: draft.lines.filter((item) => item.id !== line.id) }); }}>Eliminar</button></td>
+        </tr>)}</tbody></table>{visibleLines(draft).length === 0 && lineFilter !== "missing" && <div className="table-message">No hay productos en este filtro.</div>}</div>
         {problems(draft).length > 0 && <ul className="block-errors">{problems(draft).map((problem) => <li key={problem}>{problem}</li>)}</ul>}
         <label className="notes-field"><span>Observaciones</span><textarea rows={2} value={draft.notes} onChange={(event) => patchDraft(draft.id, { notes: event.target.value })} /></label>
         <div className="form-actions">{draft.status === "created" ? <a className="primary-button" href={`#purchase-orders/${draft.createdOrderId}`}>OC creada correctamente</a> : <button className="primary-button" type="button" disabled={draft.status === "saving" || problems(draft).length > 0} onClick={() => createOrder(draft)}>{draft.status === "saving" ? "Creando OC…" : "Confirmar y crear OC"}</button>}</div>
