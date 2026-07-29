@@ -11,6 +11,11 @@ interface DeliveryDraftLine { sku: string; delivered_quantity: number; rejected_
 const typeLabels: Record<string, string> = { without_issue: "Entregado sin novedad", confirmed: "Entrega confirmada", with_issue: "Entregado con novedad", missing_stock: "Faltante en despacho", delivery_issue: "Novedad de entrega", product_outside_purchase_order: "Producto fuera de OC", returned_product_review: "Devolución en revisión" };
 const decisionLabels: Record<string, string> = { found_available: "Producto encontrado y disponible", retry_dispatch: "Reintentar despacho", confirm_physical_shortage: "Confirmar faltante físico" };
 export function DeliveryIncidentCenter() {
+  const [initialInvoiceId] = useState(() => {
+    const value = sessionStorage.getItem("inventario.deliveryInvoiceId");
+    sessionStorage.removeItem("inventario.deliveryInvoiceId");
+    return value;
+  });
   const [invoices, setInvoices] = useState<Invoice[]>([]);
   const [incidents, setIncidents] = useState<Incident[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -37,10 +42,15 @@ export function DeliveryIncidentCenter() {
   useEffect(() => {
     Promise.all([apiRequest<Invoice[]>("/invoices"), apiRequest<Incident[]>("/incidents")]).then(([loadedInvoices, loadedIncidents]) => {
       setInvoices(loadedInvoices); setIncidents(loadedIncidents);
-      setSelectedId(loadedInvoices.find((item) => item.dispatch_status !== "pending" && item.delivery_status === "pending")?.id ?? null);
+      const requested = loadedInvoices.find(
+        (item) => item.id === initialInvoiceId
+          && item.dispatch_status !== "pending"
+          && ["pending", "partial_delivery"].includes(item.delivery_status),
+      );
+      setSelectedId(requested?.id ?? loadedInvoices.find((item) => item.dispatch_status !== "pending" && item.delivery_status === "pending")?.id ?? null);
     }).catch((caught) => setError(caught instanceof Error ? caught.message : "No pudimos cargar entregas e incidencias."))
       .finally(() => setLoading(false));
-  }, []);
+  }, [initialInvoiceId]);
 
   useEffect(() => {
     if (!selectedId) return;

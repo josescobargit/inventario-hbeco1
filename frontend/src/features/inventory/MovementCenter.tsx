@@ -38,9 +38,14 @@ const toIsoBoundary = (value: string, endOfDay = false) => {
 };
 
 export function MovementCenter() {
+  const [initialInvoiceId] = useState(() => {
+    const value = sessionStorage.getItem("inventario.movementInvoiceId") ?? "";
+    sessionStorage.removeItem("inventario.movementInvoiceId");
+    return value;
+  });
   const [movements, setMovements] = useState<Movement[]>([]);
   const [selectedMovementId, setSelectedMovementId] = useState<string | null>(null);
-  const [search, setSearch] = useState("");
+  const [search, setSearch] = useState(initialInvoiceId);
   const [movementType, setMovementType] = useState("");
   const [actor, setActor] = useState("");
   const [dateFrom, setDateFrom] = useState("");
@@ -80,14 +85,16 @@ export function MovementCenter() {
   };
 
   useEffect(() => {
-    apiRequest<Movement[]>("/inventory/movements?limit=150")
+    const params = new URLSearchParams({ limit: "150" });
+    if (initialInvoiceId) params.set("search", initialInvoiceId);
+    apiRequest<Movement[]>(`/inventory/movements?${params}`)
       .then((loaded) => {
         setMovements(loaded);
         setSelectedMovementId(loaded[0]?.id ?? null);
       })
       .catch((caught) => setError(caught instanceof Error ? caught.message : "No se pudieron cargar los movimientos."))
       .finally(() => setLoading(false));
-  }, []);
+  }, [initialInvoiceId]);
 
   return <main className="dashboard movements-center">
     <section className="module-heading">

@@ -20,7 +20,7 @@ HEADER_KIND_PATTERNS = (
         ),
     ),
     ("size", re.compile(r"^(?:TAMANO|PRESENTACION|SIZE)$")),
-    ("units_per_box", re.compile(r"^(?:UXC|UC|U/C|UNIXCAJA)$")),
+    ("units_per_box", re.compile(r"^(?:UXC|UC|URE|U/C|UNIXCAJA)$")),
     ("quantity", re.compile(r"^(?:CANTIDAD|CANT|QTY|SOLICITADO|PEDIDO)$")),
     ("cost", re.compile(r"^(?:COSTO|PRECIO|VALOR|COST)$")),
 )
@@ -92,8 +92,8 @@ def _header_columns(row: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _column_boundaries(columns: list[dict[str, Any]], page_width: float):
     boundaries = [0.0]
-    for left, right in zip(columns, columns[1:]):
-        boundaries.append((left["center"] + right["center"]) / 2)
+    for right in columns[1:]:
+        boundaries.append(max(boundaries[-1], right["x0"] - page_width * 0.002))
     boundaries.append(page_width)
     return boundaries
 
@@ -399,7 +399,7 @@ def extract_known_ocr_text_rows(
         return []
 
     pattern = re.compile(
-        r"(?m)^\s*(\d{2})([A-ZÁÉÍÓÚÑ]+(?:\s+[A-ZÁÉÍÓÚÑ]+)*)\s+"
+        r"(?m)^\s*([0O][1IL])\s*([A-ZÁÉÍÓÚÑ]+(?:\s+[A-ZÁÉÍÓÚÑ]+)*)\s+"
         r"(\d+\s*[uU])\s+(\d+)\s+(\d{13})\s+(\d+)\s+"
         r"[\d.,]+\s+(\d+)\s*$"
     )
@@ -415,7 +415,7 @@ def extract_known_ocr_text_rows(
             {
                 "page": page_number,
                 "raw": match.group(0).strip(),
-                "item_number": match.group(1),
+                "item_number": "01",
                 "chain_code": match.group(4),
                 "description": f"{description} {size}".strip(),
                 "supplier_reference": match.group(5),
@@ -472,6 +472,23 @@ def extract_visual_word_rows(
         description = cells.get("description", "").strip()
         if quantity is None:
             continuation = description or cells.get("size", "")
+            reference_continuation = re.sub(
+                r"\s+", "", cells.get("supplier_reference", "")
+            )
+            existing_reference = re.sub(
+                r"\s+", "", (last_product or {}).get("supplier_reference") or ""
+            )
+            if (
+                last_product
+                and reference_continuation.isdigit()
+                and existing_reference.isdigit()
+                and len(existing_reference) + len(reference_continuation) == 13
+            ):
+                last_product["supplier_reference"] = (
+                    existing_reference + reference_continuation
+                )
+                last_product["raw"] = f"{last_product['raw']} {raw}".strip()
+                continue
             has_new_identity = bool(
                 cells.get("item")
                 or cells.get("article_code")
@@ -510,17 +527,14 @@ def extract_visual_word_rows(
         ):
             supplier_reference += trailing_reference.group(1)
             description = description[: trailing_reference.start()].strip()
+        item_match = re.search(r"\b(\d+)\b", cells.get("item", ""))
         product = {
             "page": page_number,
             "raw": raw,
-            "item_number": (
-                cells.get("item")
-                if re.fullmatch(r"\d+", cells.get("item", "").strip())
-                else None
-            ),
-            "chain_code": cells.get("article_code") or None,
-            "description": description,
-            "supplier_reference": supplier_reference,
+            "item_number": item_match.group(1) if item_match else None,
+            "chain_code": _distinct_code(cells.get("article_code")),
+            "description": description.strip(" |[]"),
+            "supplier_reference": _distinct_code(supplier_reference),
             "size": size or None,
             "units_per_box": _first_integer(cells.get("units_per_box", "")),
             "quantity": quantity,

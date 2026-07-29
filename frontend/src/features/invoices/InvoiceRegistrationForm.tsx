@@ -1,6 +1,7 @@
 import { ChangeEvent, DragEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 
-import { apiRequest, apiUpload } from "../../api/client";
+import { apiRequest } from "../../api/client";
+import { submitDocumentJobs } from "../../api/documentJobs";
 import {
   applyConfirmedAlias, parseInvoiceBlocks, parseProductLines,
   QuickBlock, QuickLine, retryProductRecognition,
@@ -208,29 +209,25 @@ export function InvoiceRegistrationForm({ onCreated, onCancel, template, editing
     const allowed = incoming.filter((file) =>
       ["application/pdf", "image/jpeg", "image/png", "image/webp"].includes(file.type),
     );
-    setFiles((current) => [...current, ...allowed].slice(0, 50));
+    setFiles((current) => [...current, ...allowed].slice(0, 10));
+    if (incoming.length > 10) setError("Procesa hasta 10 documentos por lote; el OCR se ejecuta de uno en uno.");
     if (allowed.length !== incoming.length) setError("Se ignoraron archivos que no son PDF o imagen.");
   };
   const processFiles = async () => {
     if (!files.length) return;
     setSaving(true); setError(null);
-    const pending = [...files];
     const recognized: Array<{ filename: string; status: string; detail?: string; text: string; table_rows?: Array<{ raw: string }> }> = [];
-    const worker = async () => {
-      while (pending.length) {
-        const file = pending.shift();
-        if (!file) return;
-        const body = new FormData();
-        body.append("files", file);
-        try {
-          const result = await apiUpload<{ documents: typeof recognized }>("/invoices/imports/preview", body);
-          recognized.push(...result.documents);
-        } catch (caught) {
-          recognized.push({ filename: file.name, status: "error", detail: caught instanceof Error ? caught.message : "No se pudo reconocer.", text: "" });
-        }
-      }
-    };
-    await Promise.all(Array.from({ length: Math.min(3, files.length) }, worker));
+    try {
+      const jobs = await submitDocumentJobs<(typeof recognized)[number]>({
+        kind: "customer_invoice",
+        files: files.slice(0, 10),
+      });
+      recognized.push(...jobs.map((job) => job.result!).filter(Boolean));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "No se pudieron procesar los documentos.");
+      setSaving(false);
+      return;
+    }
     recognized.forEach((document) => {
       if (document.status === "error") {
         setError((current) => [current, `${document.filename}: ${document.detail}`].filter(Boolean).join(" · "));

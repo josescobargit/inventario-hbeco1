@@ -8,6 +8,7 @@ from app.modules.dispatches.api.router import router as dispatches_router
 from app.modules.dashboard.api.router import router as dashboard_router
 from app.modules.deliveries.api.router import router as deliveries_router
 from app.modules.documents.api.router import router as documents_router
+from app.modules.documents.api.job_router import router as document_jobs_router
 from app.modules.returns.api.router import router as returns_router
 from app.modules.incidents.api.router import router as incidents_router
 from app.modules.inventory.api.router import router as inventory_router
@@ -15,6 +16,7 @@ from app.modules.inventory_operations.api.router import (
     router as inventory_operations_router,
 )
 from app.modules.invoices.api.router import router as invoices_router
+from app.modules.invoices.api.audit_router import router as invoice_audit_router
 from app.modules.invoices.api.trace_router import router as invoice_trace_router
 from app.modules.reports.api.router import router as reports_router
 from app.modules.reservations.api.router import router as reservations_router
@@ -37,11 +39,13 @@ api_router.include_router(dashboard_router)
 api_router.include_router(dispatches_router)
 api_router.include_router(deliveries_router)
 api_router.include_router(documents_router)
+api_router.include_router(document_jobs_router)
 api_router.include_router(returns_router)
 api_router.include_router(incidents_router)
 api_router.include_router(inventory_router)
 api_router.include_router(inventory_operations_router)
 api_router.include_router(invoices_router)
+api_router.include_router(invoice_audit_router)
 api_router.include_router(invoice_trace_router)
 api_router.include_router(reports_router)
 api_router.include_router(reservations_router)

@@ -44,6 +44,23 @@ const previewResponse = {
     }],
   }],
 };
+const completedJobResponse = (result: unknown) => ({
+  jobs: [{
+    id: "11111111-1111-4111-8111-111111111111",
+    filename: "orden.pdf",
+    status: "review",
+    progress: 100,
+    requires_ocr: false,
+    result,
+    error: null,
+  }],
+  queue: {
+    pending_ocr_jobs: 0,
+    pending_digital_jobs: 0,
+    active_ocr_jobs: 0,
+    active_digital_jobs: 0,
+  },
+});
 
 describe("PurchaseOrderDocumentImport", () => {
   it("abre la pantalla sin realizar una solicitud de procesamiento", () => {
@@ -55,8 +72,26 @@ describe("PurchaseOrderDocumentImport", () => {
     expect(screen.queryByText("Not Found")).not.toBeInTheDocument();
   });
 
+  it("retoma un trabajo pendiente al volver a la pantalla", async () => {
+    const jobId = "11111111-1111-4111-8111-111111111111";
+    sessionStorage.setItem("document-jobs:purchase_order", jobId);
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse(completedJobResponse(previewResponse)),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<PurchaseOrderDocumentImport products={[]} orders={[]} onCreated={vi.fn()} onCancel={vi.fn()} />);
+
+    expect(await screen.findByLabelText("Resumen del reconocimiento")).toBeVisible();
+    expect(fetchMock).toHaveBeenCalledWith(
+      `/api/v1/document-jobs?ids=${jobId}`,
+      expect.objectContaining({ credentials: "include" }),
+    );
+    expect(sessionStorage.getItem("document-jobs:purchase_order")).toBeNull();
+  });
+
   it("selecciona un PDF y envía multipart al endpoint que existe", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(previewResponse));
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(completedJobResponse(previewResponse)));
     vi.stubGlobal("fetch", fetchMock);
     const { container } = render(<PurchaseOrderDocumentImport products={[]} orders={[]} onCreated={vi.fn()} onCancel={vi.fn()} />);
     const file = new File(["%PDF-1.7"], "orden.pdf", { type: "application/pdf" });
@@ -70,7 +105,7 @@ describe("PurchaseOrderDocumentImport", () => {
     expect(await screen.findByLabelText("Resumen del reconocimiento")).toBeVisible();
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [url, init] = fetchMock.mock.calls[0]!;
-    expect(url).toBe("/api/v1/purchase-orders/imports/preview");
+    expect(url).toBe("/api/v1/document-jobs");
     expect(init.method).toBe("POST");
     expect(init.body).toBeInstanceOf(FormData);
     expect(init.headers).not.toHaveProperty("Content-Type");
@@ -135,7 +170,7 @@ describe("PurchaseOrderDocumentImport", () => {
   it("convierte el 404 en un diagnóstico útil y permite reintentar", async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(jsonResponse({ detail: "Not Found" }, 404))
-      .mockResolvedValueOnce(jsonResponse(previewResponse));
+      .mockResolvedValueOnce(jsonResponse(completedJobResponse(previewResponse)));
     vi.stubGlobal("fetch", fetchMock);
     render(<PurchaseOrderDocumentImport products={[]} orders={[]} onCreated={vi.fn()} onCancel={vi.fn()} />);
     fireEvent.change(screen.getByPlaceholderText("Pega aquí el contenido completo de la orden…"), { target: { value: "OC-10" } });
@@ -151,7 +186,7 @@ describe("PurchaseOrderDocumentImport", () => {
   it("separa detectados, no encontrados y líneas faltantes sin mostrar encabezados como productos", async () => {
     vi.stubGlobal("fetch", vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
       if (String(input).includes("/customer-aliases")) return jsonResponse([]);
-      return jsonResponse({
+      return jsonResponse(completedJobResponse({
         drafts: [{
           document_token: "token-1",
           filename: "orden.pdf",
@@ -210,7 +245,7 @@ describe("PurchaseOrderDocumentImport", () => {
             },
           ],
         }],
-      });
+      }));
     }));
 
     render(<PurchaseOrderDocumentImport

@@ -14,7 +14,7 @@ from sqlalchemy import (
     UniqueConstraint,
     Uuid,
 )
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, validates
 from app.core.database import Base
 from app.core.time import utc_now
 
@@ -30,6 +30,13 @@ class Invoice(Base):
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     invoice_number: Mapped[str] = mapped_column(
         String(17), unique=True, nullable=False, index=True
+    )
+    establishment_number: Mapped[str] = mapped_column(
+        String(3), nullable=False, index=True
+    )
+    emission_point: Mapped[str] = mapped_column(String(3), nullable=False, index=True)
+    sequential_number: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, index=True
     )
     idempotency_key: Mapped[str | None] = mapped_column(
         String(100), unique=True, nullable=True, index=True
@@ -73,6 +80,30 @@ class Invoice(Base):
     inventory_reversed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    inventory_status: Mapped[str] = mapped_column(
+        String(30), default="pending", nullable=False, index=True
+    )
+    inventory_discounted_quantity: Mapped[int] = mapped_column(
+        BigInteger, default=0, nullable=False
+    )
+    inventory_movement_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid,
+        ForeignKey("inventory_movements.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    inventory_last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    inventory_attempts: Mapped[int] = mapped_column(
+        BigInteger, default=0, nullable=False
+    )
+
+    @validates("invoice_number")
+    def synchronize_sequence(self, _key: str, value: str) -> str:
+        establishment, emission, sequential = value.split("-")
+        self.establishment_number = establishment
+        self.emission_point = emission
+        self.sequential_number = int(sequential)
+        return value
 
 
 class InvoiceLine(Base):

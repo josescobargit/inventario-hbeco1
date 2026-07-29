@@ -39,9 +39,12 @@ describe("InventoryOperationCenter", () => {
       })),
     }];
     const fetchMock = vi.fn().mockImplementation(async (request: string, init?: RequestInit) => {
-      if (String(request).includes("/supplier-invoices/imports/preview")) {
+      if (String(request).includes("/document-jobs") && init?.method === "POST") {
         expect(init?.body).toBeInstanceOf(FormData);
-        return new Response(JSON.stringify(preview), { status: 200, headers: { "Content-Type": "application/json" } });
+        return new Response(JSON.stringify({
+          jobs: [{ id: "job-1", filename: "factura.pdf", status: "review", progress: 100, requires_ocr: false, result: preview[0], error: null }],
+          queue: { pending_ocr_jobs: 0, pending_digital_jobs: 0, active_ocr_jobs: 0, active_digital_jobs: 0 },
+        }), { status: 202, headers: { "Content-Type": "application/json" } });
       }
       return emptyResponse();
     });
@@ -54,7 +57,7 @@ describe("InventoryOperationCenter", () => {
     expect(await screen.findByText("Líneas detectadas:")).toBeVisible();
     expect(screen.getAllByRole("button", { name: "Duplicar" })).toHaveLength(2);
     expect(fetchMock).toHaveBeenCalledWith(
-      expect.stringContaining("/supplier-invoices/imports/preview"),
+      expect.stringContaining("/document-jobs"),
       expect.objectContaining({ method: "POST", body: expect.any(FormData) }),
     );
   });

@@ -173,6 +173,11 @@ function ProductSearch({ products, value, disabledSkus, onChange, onProductLoade
 }
 
 export function PurchaseOrderCenter() {
+  const [initialOpenOrderId] = useState(() => {
+    const value = sessionStorage.getItem("inventario.openPurchaseOrderId");
+    sessionStorage.removeItem("inventario.openPurchaseOrderId");
+    return value;
+  });
   const [orders, setOrders] = useState<PurchaseOrder[]>([]);
   const [products, setProducts] = useState<ProductOption[]>([]);
   const [suggestedChains, setSuggestedChains] = useState(DEFAULT_CHAINS);
@@ -217,6 +222,7 @@ export function PurchaseOrderCenter() {
   const orderNumberRef = useRef<HTMLInputElement>(null);
   const submitLock = useRef(false);
   const successTimerRef = useRef<number | null>(null);
+  const initialOpenHandled = useRef(false);
 
   const normalizeDetail = (order: PurchaseOrder): PurchaseOrder => ({
     ...order, product_count: order.lines.length,
@@ -250,9 +256,19 @@ export function PurchaseOrderCenter() {
         const full = Array.isArray(response) ? response.find((order) => order.id === item.id) : null;
         return full ? normalizeDetail(full) : summaryOrder(item);
       });
-      setOrders((current) => append ? [...current, ...summaries] : summaries);
+      if (!append && initialOpenOrderId && !initialOpenHandled.current) {
+        initialOpenHandled.current = true;
+        const detail = normalizeDetail(
+          await apiRequest<PurchaseOrder>(`/purchase-orders/${initialOpenOrderId}`),
+        );
+        setOrders([detail, ...summaries.filter((order) => order.id !== detail.id)]);
+        setSelectedId(detail.id);
+        setSelectedDocumentToken(detail.source_documents[0]?.token ?? null);
+      } else {
+        setOrders((current) => append ? [...current, ...summaries] : summaries);
+        if (!append) setSelectedId(null);
+      }
       setNextCursor(page.next_cursor);
-      if (!append) setSelectedId(null);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "No pudimos cargar las órdenes de compra.");
     } finally { setLoading(false); }

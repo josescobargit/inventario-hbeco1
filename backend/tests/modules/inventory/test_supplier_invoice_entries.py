@@ -178,9 +178,13 @@ def test_frontend_supplier_invoice_route_matches_backend_contract():
         / "frontend/src/features/inventory/SupplierInvoiceImport.tsx"
     ).read_text(encoding="utf-8")
 
-    assert '"/supplier-invoices/imports/preview"' in frontend
-    assert "/api/v1/supplier-invoices/imports/preview" in app.openapi()["paths"]
-    assert "post" in app.openapi()["paths"]["/api/v1/supplier-invoices/imports/preview"]
+    helper = (Path(__file__).parents[4] / "frontend/src/api/documentJobs.ts").read_text(
+        encoding="utf-8"
+    )
+    assert 'kind: "supplier_invoice"' in frontend
+    assert '"/document-jobs"' in helper
+    assert "/api/v1/document-jobs" in app.openapi()["paths"]
+    assert "post" in app.openapi()["paths"]["/api/v1/document-jobs"]
 
 
 def test_supplier_invoice_import_requires_authenticated_user():

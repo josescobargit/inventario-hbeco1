@@ -1,4 +1,5 @@
 import os
+import logging
 from datetime import datetime, timezone
 
 from fastapi import FastAPI
@@ -9,6 +10,7 @@ from starlette.requests import Request
 
 from app.api.router import api_router
 from app.core.config import get_settings
+from app.modules.documents.domain.job_service import start_workers
 
 
 settings = get_settings()
@@ -33,6 +35,15 @@ def create_app() -> FastAPI:
         allow_headers=["Content-Type", "X-Requested-With", "Idempotency-Key"],
     )
     application.include_router(api_router, prefix=settings.api_prefix)
+
+    @application.on_event("startup")
+    def start_document_workers() -> None:
+        try:
+            start_workers()
+        except OperationalError:
+            logging.getLogger("inventario.document_jobs").warning(
+                "Document workers will start after the database schema is available."
+            )
 
     @application.exception_handler(OperationalError)
     async def database_unavailable(

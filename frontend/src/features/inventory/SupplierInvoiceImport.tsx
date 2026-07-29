@@ -1,6 +1,7 @@
 import { ChangeEvent, DragEvent, useEffect, useMemo, useRef, useState } from "react";
 
-import { apiRequest, apiUpload } from "../../api/client";
+import { apiRequest } from "../../api/client";
+import { cancelDocumentJob, DocumentJob, resumeDocumentJobs, submitDocumentJobs } from "../../api/documentJobs";
 import { ProductCombobox, type SearchableProduct } from "../purchase-orders/ProductCombobox";
 
 type MatchStatus = "recognized" | "requires_confirmation" | "not_found";
@@ -64,12 +65,24 @@ export function SupplierInvoiceImport({ products, onInventoryChanged }: {
   const [registered, setRegistered] = useState<RegisteredInvoice[]>([]);
   const [filter, setFilter] = useState<"all" | "recognized" | "pending">("all");
   const [loading, setLoading] = useState(false);
+  const [jobs, setJobs] = useState<DocumentJob<SupplierInvoiceDraft>[]>([]);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
 
   const loadHistory = () => apiRequest<RegisteredInvoice[]>("/supplier-invoices").then(setRegistered);
   useEffect(() => { void loadHistory().catch(() => undefined); }, []);
+  useEffect(() => {
+    void resumeDocumentJobs<SupplierInvoiceDraft>("supplier_invoice", (response) => setJobs(response.jobs))
+      .then((completed) => {
+        const found = completed.map((job) => job.result!).filter(Boolean);
+        if (found.length) setDrafts(found.map((draft) => ({
+          ...draft,
+          lines: draft.lines.map((line) => ({ ...line, reviewed: line.status === "recognized" })),
+        })));
+      })
+      .catch((caught) => setError(caught instanceof Error ? caught.message : "No se pudo recuperar el trabajo."));
+  }, []);
 
   const chooseFiles = (selected: File[]) => {
     setError(null); setMessage(null);
@@ -83,10 +96,13 @@ export function SupplierInvoiceImport({ products, onInventoryChanged }: {
   const analyze = async () => {
     if (!files.length) return;
     setLoading(true); setError(null); setMessage(null);
-    const body = new FormData();
-    files.forEach((file) => body.append("files", file));
     try {
-      const found = await apiUpload<SupplierInvoiceDraft[]>("/supplier-invoices/imports/preview", body);
+      const completed = await submitDocumentJobs<SupplierInvoiceDraft>({
+        kind: "supplier_invoice",
+        files,
+        onUpdate: (response) => setJobs(response.jobs),
+      });
+      const found = completed.map((job) => job.result!).filter(Boolean);
       setDrafts(found.map((draft) => ({
         ...draft,
         lines: draft.lines.map((line) => ({ ...line, reviewed: line.status === "recognized" })),
@@ -177,6 +193,7 @@ export function SupplierInvoiceImport({ products, onInventoryChanged }: {
       <button className="secondary-button" type="button" onClick={() => input.current?.click()}>Seleccionar archivos</button>
       {files.length > 0 && <ul>{files.map((file) => <li key={`${file.name}-${file.size}`}>{file.name}</li>)}</ul>}
       <button className="primary-button" type="button" disabled={!files.length || loading} onClick={analyze}>{loading ? "Procesando documentos…" : "Leer y revisar"}</button>
+      {jobs.length > 0 && <div className="document-queue-status">{jobs.length} documentos recibidos · {jobs.filter((job) => job.status === "processing").length} procesando · {jobs.filter((job) => job.status === "pending").length} en espera {jobs.filter((job) => job.status === "pending").map((job) => <button className="text-button" type="button" key={job.id} onClick={() => void cancelDocumentJob(job.id)}>Cancelar {job.filename}</button>)}</div>}
     </div>}
     {drafts.length > 0 && <>
       <div className="review-filters" aria-label="Filtros de revisión">

@@ -1,4 +1,3 @@
-import hashlib
 import re
 import unicodedata
 from collections import defaultdict
@@ -8,6 +7,7 @@ from difflib import SequenceMatcher
 from typing import Annotated
 from uuid import UUID
 
+import fitz
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy import or_, select
@@ -24,7 +24,11 @@ from app.modules.inventory.infrastructure.models import (
     InventoryPositionModel,
     Warehouse,
 )
-from app.modules.supplier_invoices.domain.extraction import extract_supplier_invoice
+from app.modules.documents.domain.extraction_runner import run_document_extraction
+from app.modules.documents.domain.upload_stream import stream_upload
+from app.modules.supplier_invoices.domain.extraction import (
+    supplier_result_from_extracted,
+)
 from app.modules.supplier_invoices.infrastructure.models import (
     SupplierInvoice,
     SupplierInvoiceLine,
@@ -275,26 +279,23 @@ async def preview_supplier_invoices(
     del user
     previews = []
     for uploaded in files:
-        content = await uploaded.read(MAX_FILE_SIZE + 1)
-        content_type = (uploaded.content_type or "").lower()
-        if content_type not in ALLOWED_CONTENT_TYPES:
-            raise HTTPException(
-                status_code=400,
-                detail=f"{uploaded.filename}: usa PDF, PNG, JPG o WEBP.",
-            )
-        if len(content) > MAX_FILE_SIZE:
-            raise HTTPException(
-                status_code=400,
-                detail=f"{uploaded.filename}: supera el límite de 15 MB.",
-            )
-        if not content:
-            raise HTTPException(
-                status_code=400, detail=f"{uploaded.filename}: el archivo está vacío."
-            )
+        document = await stream_upload(
+            uploaded,
+            allowed_types=ALLOWED_CONTENT_TYPES,
+            max_bytes=MAX_FILE_SIZE,
+        )
         try:
-            extracted = extract_supplier_invoice(
-                content, content_type, uploaded.filename or "documento"
+            raw = run_document_extraction(document)
+            pdf = (
+                fitz.open(document.path)
+                if document.content_type == "application/pdf"
+                else None
             )
+            try:
+                extracted = supplier_result_from_extracted(raw, pdf)
+            finally:
+                if pdf is not None:
+                    pdf.close()
         except Exception as error:
             raise HTTPException(
                 status_code=422,
@@ -303,6 +304,8 @@ async def preview_supplier_invoices(
                     f"Detalle: {error}"
                 ),
             ) from error
+        finally:
+            document.cleanup()
         match = _product_matcher(db, extracted.get("supplier_ruc"))
         lines = [{**line, **match(line)} for line in extracted["lines"]]
         warnings = list(extracted["warnings"])
@@ -312,7 +315,7 @@ async def preview_supplier_invoices(
             {
                 **extracted,
                 "original_filename": uploaded.filename,
-                "file_sha256": hashlib.sha256(content).hexdigest(),
+                "file_sha256": document.sha256,
                 "lines": lines,
                 "summary": {
                     "detected": len(lines),

@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { InvoiceCenter } from "./InvoiceCenter";
@@ -8,7 +8,7 @@ describe("InvoiceCenter", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue(
-        new Response(JSON.stringify([]), {
+        new Response(JSON.stringify({ items: [], page: 1, pages: 1, total: 0, missing_sequences: [] }), {
           status: 200,
           headers: { "Content-Type": "application/json" },
         }),
@@ -27,7 +27,9 @@ describe("InvoiceCenter", () => {
       id: "invoice-1", invoice_number: "001-001-000000001", invoice_date: "2026-07-28",
       customer_name: "Cliente", chain_name: "Cadena", total_value: "10",
       administrative_status: "confirmed", dispatch_status: "pending",
-      delivery_status: "pending", incident_status: "none",
+      delivery_status: "pending", purchase_order_id: "order-1",
+      purchase_order_number: "OC-1", product_count: 1, units: 10,
+      inventory: { status: "correct", status_label: "Descontada correctamente", discounted_units: 10, difference: 0 },
     };
     const trace = {
       invoice: {
@@ -35,7 +37,8 @@ describe("InvoiceCenter", () => {
         customer: "Cliente", chain: "Cadena", source_type: "purchase_order",
         authorization_number: null, remittance_guide: null, notes: null,
         total_value: "10", net_value: "10",
-        statuses: { administrative: "confirmed", dispatch: "pending", delivery: "pending", incident: "none", return: "none" },
+        statuses: { administrative: "confirmed", dispatch: "pending", delivery: "pending", incident: "none", return: "none", inventory: "correct" },
+        inventory: { status: "correct", status_label: "Descontada correctamente", discounted_at: "2026-07-28T12:00:00Z", discounted_quantity: 10, movement_ids: ["movement-1"], last_error: null, attempts: 1 },
       },
       purchase_order: { id: "order-1", number: "OC-1", chain: "Cadena" },
       lines: [{
@@ -47,7 +50,7 @@ describe("InvoiceCenter", () => {
     };
     vi.stubGlobal("fetch", vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input);
-      return new Response(JSON.stringify(url.includes("/traceability") ? trace : [summary]), {
+      return new Response(JSON.stringify(url.includes("/traceability") ? trace : { items: [summary], page: 1, pages: 1, total: 1, missing_sequences: [] }), {
         status: 200, headers: { "Content-Type": "application/json" },
       });
     }));
@@ -61,5 +64,23 @@ describe("InvoiceCenter", () => {
     expect(table).toHaveTextContent("8");
     expect(table).toHaveTextContent("2");
     expect(table).toHaveTextContent("-2");
+  });
+
+  it("audita sin modificar y exige vista previa antes de corregir", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const data = url.includes("correction-preview")
+        ? { correctable: [{ id: "invoice-2", invoice_number: "001-001-000000002", status_label: "Sin descontar", units_to_discount: 12 }], blocked: [], will_change_inventory: true }
+        : url.includes("inventory-audit")
+          ? { summary: { reviewed: 1, correct: 0, missing: 1, partial: 0, duplicate: 0, over: 0, cancelled_correct: 0, cancelled_missing_reversal: 0, errors: 0 }, items: [{ id: "invoice-2", invoice_number: "001-001-000000002", invoice_date: "2026-07-28", invoiced_units: 12, discounted_units: 0, difference: 12, status: "missing", status_label: "Sin descontar" }] }
+          : { items: [], page: 1, pages: 1, total: 0, missing_sequences: [] };
+      return new Response(JSON.stringify(data), { status: 200, headers: { "Content-Type": "application/json" } });
+    }));
+    const { container } = render(<InvoiceCenter />);
+    fireEvent.click(within(container).getByRole("button", { name: "Auditar facturas" }));
+    expect(await within(container).findByText(/001-001-000000002/)).toBeVisible();
+    fireEvent.click(within(container).getByRole("button", { name: "Corregir movimientos pendientes" }));
+    expect(await within(container).findByText(/salida pendiente de 12 unidades/)).toBeVisible();
+    expect(within(container).getByRole("button", { name: "Confirmar y corregir diferencias" })).toBeVisible();
   });
 });

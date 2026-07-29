@@ -1,7 +1,8 @@
 import base64
 import json
+import os
+import shutil
 import tempfile
-import threading
 import uuid
 from hashlib import sha256
 from datetime import date, datetime, timedelta, timezone
@@ -42,11 +43,16 @@ from app.modules.purchase_orders.domain.document_extraction import (
     classify_document,
     expected_product_count,
     extraction_signals,
-    extract_document,
     normalize_identity,
     recognized_header,
     split_purchase_orders,
     suggest_chains_from_confirmed_aliases,
+)
+from app.modules.documents.domain.extraction_runner import run_document_extraction
+from app.modules.documents.domain.upload_stream import (
+    TEMP_DIRECTORY,
+    StreamedDocument,
+    stream_upload,
 )
 from app.modules.purchase_orders.domain.customer_profiles import (
     aliases_for_chain,
@@ -463,7 +469,9 @@ def decode_order_cursor(cursor: str) -> tuple[datetime, uuid.UUID]:
         payload = json.loads(base64.urlsafe_b64decode(padded))
         return datetime.fromisoformat(payload["created_at"]), uuid.UUID(payload["id"])
     except (ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
-        raise HTTPException(status_code=422, detail="El cursor de paginación no es válido.") from error
+        raise HTTPException(
+            status_code=422, detail="El cursor de paginación no es válido."
+        ) from error
 
 
 @router.get("")
@@ -488,9 +496,7 @@ def list_orders(
     )
     statement = (
         select(PurchaseOrder, func.coalesce(line_counts.c.product_count, 0))
-        .outerjoin(
-            line_counts, line_counts.c.purchase_order_id == PurchaseOrder.id
-        )
+        .outerjoin(line_counts, line_counts.c.purchase_order_id == PurchaseOrder.id)
         .order_by(PurchaseOrder.created_at.desc(), PurchaseOrder.id.desc())
     )
     if search and search.strip():
@@ -580,11 +586,13 @@ def write_preview(token: uuid.UUID, content: bytes) -> None:
     path = preview_path(token)
     path.write_bytes(content)
     path.chmod(0o600)
-    cleanup = threading.Timer(
-        PREVIEW_TTL.total_seconds(), delete_preview, args=(token,)
-    )
-    cleanup.daemon = True
-    cleanup.start()
+
+
+def write_preview_path(token: uuid.UUID, source: Path) -> None:
+    PREVIEW_DIRECTORY.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = preview_path(token)
+    shutil.copyfile(source, path)
+    path.chmod(0o600)
 
 
 def delete_preview(token: uuid.UUID) -> None:
@@ -615,22 +623,34 @@ async def preview_purchase_order_documents(
     files: Annotated[list[UploadFile] | None, File()] = None,
     pasted_text: Annotated[str | None, Form(max_length=200_000)] = None,
 ):
-    inputs: list[tuple[str, str, bytes]] = []
+    inputs: list[StreamedDocument] = []
     for upload in files or []:
-        content = await upload.read(MAX_DOCUMENT_BYTES + 1)
-        content_type = (upload.content_type or "").lower()
-        if content_type not in ALLOWED_DOCUMENT_TYPES:
-            raise HTTPException(
-                status_code=422,
-                detail=f"{upload.filename}: usa PDF, JPG, JPEG, PNG o WEBP.",
+        inputs.append(
+            await stream_upload(
+                upload,
+                allowed_types=ALLOWED_DOCUMENT_TYPES - {"text/plain"},
+                max_bytes=MAX_DOCUMENT_BYTES,
             )
-        if len(content) > MAX_DOCUMENT_BYTES:
-            raise HTTPException(
-                status_code=413, detail=f"{upload.filename}: supera el límite de 15 MB."
-            )
-        inputs.append((upload.filename or "documento", content_type, content))
+        )
     if pasted_text and pasted_text.strip():
-        inputs.append(("pedido-pegado.txt", "text/plain", pasted_text.encode("utf-8")))
+        TEMP_DIRECTORY.mkdir(mode=0o700, parents=True, exist_ok=True)
+        content = pasted_text.strip().encode("utf-8")
+        descriptor, path_value = tempfile.mkstemp(
+            prefix="pasted-", suffix=".txt", dir=TEMP_DIRECTORY
+        )
+        with os.fdopen(descriptor, "wb") as target:
+            target.write(content)
+        inputs.append(
+            StreamedDocument(
+                path=Path(path_value),
+                filename="pedido-pegado.txt",
+                content_type="text/plain",
+                size_bytes=len(content),
+                sha256=sha256(content).hexdigest(),
+                page_count=1,
+                requires_ocr=False,
+            )
+        )
     if not inputs:
         raise HTTPException(
             status_code=422, detail="Carga un documento o pega el pedido."
@@ -638,19 +658,23 @@ async def preview_purchase_order_documents(
     purge_expired_previews(db)
 
     drafts = []
-    temporary_files: list[tuple[uuid.UUID, bytes]] = []
-    for filename, content_type, content in inputs:
-        digest = sha256(content).hexdigest()
+    temporary_tokens: list[uuid.UUID] = []
+    for uploaded in inputs:
+        filename = uploaded.filename
+        content_type = uploaded.content_type
+        digest = uploaded.sha256
         try:
             if content_type == "text/plain":
-                extracted_text = f"[[PAGE:1]]\n{content.decode('utf-8')}"
+                extracted_text = (
+                    f"[[PAGE:1]]\n{uploaded.path.read_text(encoding='utf-8')}"
+                )
                 method = "pasted_text"
                 page_count = 1
                 warnings = ()
                 table_rows = ()
                 expected_count = expected_product_count(extracted_text, table_rows)
             else:
-                extracted = extract_document(content, content_type, filename)
+                extracted = run_document_extraction(uploaded)
                 extracted_text = extracted.text
                 method = extracted.method
                 page_count = extracted.page_count
@@ -658,6 +682,8 @@ async def preview_purchase_order_documents(
                 table_rows = extracted.table_rows
                 expected_count = extracted.expected_product_count
         except (RuntimeError, ValueError, OSError) as error:
+            for item in inputs:
+                item.cleanup()
             raise HTTPException(
                 status_code=422, detail=f"{filename}: {error}"
             ) from error
@@ -727,16 +753,19 @@ async def preview_purchase_order_documents(
                     "separation_needs_review": len(parts) > 1,
                 }
             )
-        temporary_files.append((document.upload_token, content))
+        write_preview_path(document.upload_token, uploaded.path)
+        temporary_tokens.append(document.upload_token)
+        uploaded.cleanup()
     try:
-        for token, content in temporary_files:
-            write_preview(token, content)
         db.commit()
     except Exception:
         db.rollback()
-        for token, _content in temporary_files:
+        for token in temporary_tokens:
             delete_preview(token)
         raise
+    finally:
+        for uploaded in inputs:
+            uploaded.cleanup()
     return {"drafts": drafts}
 
 
@@ -1192,13 +1221,13 @@ async def attach_corrected_document(
         raise HTTPException(
             status_code=404, detail="No encontramos la orden de compra."
         )
-    content = await file.read(MAX_DOCUMENT_BYTES + 1)
-    content_type = (file.content_type or "").lower()
-    if content_type not in ALLOWED_DOCUMENT_TYPES - {"text/plain"}:
-        raise HTTPException(status_code=422, detail="Usa PDF, JPG, JPEG, PNG o WEBP.")
-    if len(content) > MAX_DOCUMENT_BYTES:
-        raise HTTPException(status_code=413, detail="El archivo supera 15 MB.")
-    digest = sha256(content).hexdigest()
+    uploaded = await stream_upload(
+        file,
+        allowed_types=ALLOWED_DOCUMENT_TYPES - {"text/plain"},
+        max_bytes=MAX_DOCUMENT_BYTES,
+    )
+    content_type = uploaded.content_type
+    digest = uploaded.sha256
     duplicate = db.scalar(
         select(PurchaseOrderSourceDocument.id)
         .join(
@@ -1211,10 +1240,14 @@ async def attach_corrected_document(
         )
     )
     if duplicate:
+        uploaded.cleanup()
         raise HTTPException(
             status_code=409, detail="Este documento ya está adjunto a la OC."
         )
-    extracted = extract_document(content, content_type, file.filename or "documento")
+    try:
+        extracted = run_document_extraction(uploaded)
+    finally:
+        uploaded.cleanup()
     document = PurchaseOrderSourceDocument(
         original_filename=file.filename or "documento-corregido",
         content_type=content_type,

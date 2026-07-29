@@ -28,7 +28,8 @@ from app.modules.purchase_orders.infrastructure.models import (
     PurchaseOrder,
     PurchaseOrderLine,
 )
-from app.modules.purchase_orders.domain.document_extraction import extract_document
+from app.modules.documents.domain.extraction_runner import run_document_extraction
+from app.modules.documents.domain.upload_stream import stream_upload
 from app.modules.reservations.infrastructure.models import Reservation, ReservationLine
 from app.modules.settings.domain.operational import exception_invoices_allowed
 
@@ -129,21 +130,13 @@ async def preview_invoice_documents(
         raise HTTPException(status_code=422, detail="Procesa hasta 50 documentos por lote.")
     documents = []
     for upload in files:
-        content_type = (upload.content_type or "").lower()
-        if content_type not in ALLOWED_IMPORT_TYPES:
-            raise HTTPException(
-                status_code=422,
-                detail=f"{upload.filename}: usa PDF, JPG, JPEG, PNG o WEBP.",
-            )
-        content = await upload.read(MAX_IMPORT_BYTES + 1)
-        if len(content) > MAX_IMPORT_BYTES:
-            raise HTTPException(
-                status_code=413, detail=f"{upload.filename}: supera el límite de 15 MB."
-            )
+        document = await stream_upload(
+            upload,
+            allowed_types=ALLOWED_IMPORT_TYPES,
+            max_bytes=MAX_IMPORT_BYTES,
+        )
         try:
-            extracted = extract_document(
-                content, content_type, upload.filename or "documento"
-            )
+            extracted = run_document_extraction(document)
         except Exception as error:
             documents.append(
                 {
@@ -155,6 +148,8 @@ async def preview_invoice_documents(
                 }
             )
             continue
+        finally:
+            document.cleanup()
         documents.append(
             {
                 "filename": upload.filename or "documento",
@@ -309,6 +304,7 @@ def _register_invoice(
     db.add(invoice)
     db.flush()
     inventory_affected = []
+    inventory_movements = []
     for sku, line_input in requested.items():
         product, pos, warehouse = found[sku]
         remaining = line_input.quantity
@@ -372,8 +368,7 @@ def _register_invoice(
             )
         pos.physical_confirmed -= line_input.quantity
         pos.version += 1
-        db.add(
-            InventoryMovement(
+        movement = InventoryMovement(
                 warehouse_id=warehouse.id,
                 product_id=product.id,
                 purchase_order_id=invoice.purchase_order_id,
@@ -392,7 +387,9 @@ def _register_invoice(
                     "version": pos.version,
                 },
             )
-        )
+        db.add(movement)
+        db.flush()
+        inventory_movements.append(movement)
         inventory_affected.append(
             {
                 "sku": sku,
@@ -413,6 +410,15 @@ def _register_invoice(
             if line.reservation_id == reservation.id
         ):
             reservation.status = "used"
+    invoice.inventory_status = "discounted"
+    invoice.inventory_discounted_quantity = sum(
+        line.quantity for line in payload.lines
+    )
+    invoice.inventory_movement_id = (
+        inventory_movements[0].id if inventory_movements else None
+    )
+    invoice.inventory_attempts = 1
+    invoice.inventory_last_error = None
     db.add(
         AuditLog(
             actor_user_id=user.id,
@@ -540,6 +546,7 @@ def register_bulk_invoices(
                     administrative_status="cancelled",
                     dispatch_status="not_applicable",
                     delivery_status="not_applicable",
+                    inventory_status="not_applicable",
                     created_by_user_id=user.id,
                 )
                 db.add(invoice)
@@ -699,6 +706,9 @@ def cancel_invoice(
         )
     invoice.administrative_status = "cancelled"
     invoice.inventory_reversed_at = utc_now()
+    invoice.inventory_status = "reverted"
+    invoice.inventory_last_error = None
+    invoice.inventory_attempts += 1
     invoice.dispatch_status = "not_applicable"
     invoice.delivery_status = "not_applicable"
     db.add(
@@ -929,6 +939,12 @@ def update_invoice(
     invoice.remittance_guide = payload.remittance_guide
     invoice.total_value = payload.total_value
     invoice.notes = payload.notes
+    invoice.inventory_status = "discounted"
+    invoice.inventory_discounted_quantity = sum(
+        line.quantity for line in payload.lines
+    )
+    invoice.inventory_last_error = None
+    invoice.inventory_attempts += 1
     db.add(
         AuditLog(
             actor_user_id=user.id,

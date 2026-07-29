@@ -10,6 +10,7 @@ from app.modules.deliveries.infrastructure.models import Delivery, DeliveryLine
 from app.modules.dispatches.infrastructure.models import Dispatch, DispatchLine
 from app.modules.documents.infrastructure.models import InvoiceAdjustment
 from app.modules.incidents.infrastructure.models import Incident
+from app.modules.invoices.domain.inventory_audit import audit_invoices
 from app.modules.invoices.infrastructure.models import (
     Invoice,
     InvoiceAlert,
@@ -147,6 +148,7 @@ def traceability(
         (item.value for item in adjustments if item.document_type == "debit_note"),
         start=0,
     )
+    inventory_audit = audit_invoices(db, [invoice.id])[0]
     return {
         "invoice": {
             "id": invoice.id,
@@ -166,6 +168,16 @@ def traceability(
                 "delivery": invoice.delivery_status,
                 "incident": invoice.incident_status,
                 "return": invoice.return_status,
+                "inventory": inventory_audit["status"],
+            },
+            "inventory": {
+                "status": inventory_audit["status"],
+                "status_label": inventory_audit["status_label"],
+                "discounted_at": inventory_audit["discounted_at"],
+                "discounted_quantity": inventory_audit["discounted_units"],
+                "movement_ids": inventory_audit["movement_ids"],
+                "last_error": invoice.inventory_last_error,
+                "attempts": invoice.inventory_attempts,
             },
         },
         "purchase_order": {

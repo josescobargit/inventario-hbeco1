@@ -1,10 +1,10 @@
 services:
   - type: web
     name: inventario-operativo-api
-    runtime: python
+    runtime: docker
     plan: free
-    buildCommand: pip install -r backend/requirements.txt
-    startCommand: PYTHONPATH=backend alembic -c database/alembic.ini upgrade head && PYTHONPATH=backend uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
     healthCheckPath: /health
     envVars:
       - key: ENVIRONMENT
@@ -13,6 +13,18 @@ services:
         value: 3.12.13
       - key: API_PREFIX
         value: /api/v1
+      - key: DOCUMENT_OCR_CONCURRENCY
+        value: "1"
+      - key: DOCUMENT_DIGITAL_CONCURRENCY
+        value: "2"
+      - key: DOCUMENT_OCR_TIMEOUT_SECONDS
+        value: "120"
+      - key: DOCUMENT_MAX_PAGES
+        value: "50"
+      - key: DOCUMENT_MAX_IMAGE_PIXELS
+        value: "30000000"
+      - key: DOCUMENT_MEMORY_TRACING
+        value: "false"
       - key: COOKIE_SECURE
         value: "true"
       - key: COOKIE_SAMESITE

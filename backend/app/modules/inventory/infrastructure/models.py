@@ -99,6 +99,9 @@ class InventoryMovement(Base):
         Uuid, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
     )
     movement_type: Mapped[str] = mapped_column(String(60), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(
+        String(20), default="confirmed", nullable=False, index=True
+    )
     reference_type: Mapped[str | None] = mapped_column(String(60), nullable=True)
     reference_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     idempotency_key: Mapped[str | None] = mapped_column(

@@ -2,10 +2,15 @@ import re
 import unicodedata
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 
 import fitz
 
-from app.modules.purchase_orders.domain.document_extraction import extract_document
+from app.modules.purchase_orders.domain.document_extraction import (
+    ExtractedDocument,
+    extract_document,
+    extract_document_path,
+)
 
 
 INVOICE_NUMBER = re.compile(r"\b\d{3}-\d{3}-\d{9}\b")
@@ -175,8 +180,9 @@ def _company_candidates(lines: list[str]) -> list[str]:
     return result
 
 
-def extract_supplier_invoice(content: bytes, content_type: str, filename: str) -> dict:
-    extracted = extract_document(content, content_type, filename)
+def supplier_result_from_extracted(
+    extracted: ExtractedDocument, pdf: fitz.Document | None
+) -> dict:
     text = extracted.text
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     invoice_match = INVOICE_NUMBER.search(text)
@@ -205,11 +211,6 @@ def extract_supplier_invoice(content: bytes, content_type: str, filename: str) -
     issued_at = (
         datetime.strptime(dates[0], "%d/%m/%Y").date().isoformat() if dates else None
     )
-    pdf = (
-        fitz.open(stream=content, filetype="pdf")
-        if content_type == "application/pdf"
-        else None
-    )
     return {
         "supplier_ruc": supplier_ruc,
         "supplier_name": supplier_name,
@@ -226,3 +227,27 @@ def extract_supplier_invoice(content: bytes, content_type: str, filename: str) -
         "lines": _table_lines(text),
         "warnings": list(extracted.warnings),
     }
+
+
+def extract_supplier_invoice(content: bytes, content_type: str, filename: str) -> dict:
+    extracted = extract_document(content, content_type, filename)
+    pdf = (
+        fitz.open(stream=content, filetype="pdf")
+        if content_type == "application/pdf"
+        else None
+    )
+    try:
+        return supplier_result_from_extracted(extracted, pdf)
+    finally:
+        if pdf is not None:
+            pdf.close()
+
+
+def extract_supplier_invoice_path(path: Path, content_type: str, filename: str) -> dict:
+    extracted = extract_document_path(path, content_type, filename)
+    pdf = fitz.open(path) if content_type == "application/pdf" else None
+    try:
+        return supplier_result_from_extracted(extracted, pdf)
+    finally:
+        if pdf is not None:
+            pdf.close()

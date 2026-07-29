@@ -16,6 +16,7 @@ from app.modules.dispatches.infrastructure import models as dispatch_models  # n
 from app.modules.deliveries.infrastructure import models as delivery_models  # noqa: F401
 from app.modules.returns.infrastructure import models as return_models  # noqa: F401
 from app.modules.documents.infrastructure import models as document_models  # noqa: F401
+from app.modules.documents.infrastructure import job_models as document_job_models  # noqa: F401
 from app.modules.reservations.infrastructure import models as reservation_models  # noqa: F401
 from app.modules.settings.infrastructure import models as settings_models  # noqa: F401
 from app.modules.purchase_orders.infrastructure import models as purchase_order_models  # noqa: F401

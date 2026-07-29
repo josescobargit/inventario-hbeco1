@@ -1,6 +1,9 @@
-import { ChangeEvent, DragEvent, useState } from "react";
+import { ChangeEvent, DragEvent, useEffect, useRef, useState } from "react";
 
-import { ApiError, apiRequest, apiUpload, apiUrl } from "../../api/client";
+import { ApiError, apiRequest, apiUrl } from "../../api/client";
+import {
+  cancelDocumentJob, DocumentJob, resumeDocumentJobs, submitDocumentJobs,
+} from "../../api/documentJobs";
 import {
   CustomerAlias, DocumentProductLine, MatchableProduct, normalizeProductText,
   parseDocumentProductLines, extractVisibleUnitTotal, parsePositionalTableRows,
@@ -42,7 +45,7 @@ interface DraftState extends PreviewDraft {
 
 const accepted = ".pdf,.jpg,.jpeg,.png,.webp";
 const maxDocumentBytes = 15 * 1024 * 1024;
-export const purchaseOrderPreviewPath = "/purchase-orders/imports/preview";
+export const purchaseOrderPreviewPath = "/document-jobs";
 
 function documentProcessingError(caught: unknown): string {
   if (caught instanceof ApiError) {
@@ -51,6 +54,7 @@ function documentProcessingError(caught: unknown): string {
     if (caught.status >= 500) return "No se pudo procesar el documento. Detalle: el servicio de lectura tuvo un error interno.";
     return `No se pudo procesar el documento. Detalle: ${caught.message}`;
   }
+  if (caught instanceof Error) return `No se pudo procesar el documento. Detalle: ${caught.message}`;
   return "No se pudo procesar el documento. Detalle: no fue posible conectar con el servicio de lectura.";
 }
 
@@ -66,11 +70,13 @@ export function PurchaseOrderDocumentImport({
   const [pastedText, setPastedText] = useState("");
   const [drafts, setDrafts] = useState<DraftState[]>([]);
   const [processing, setProcessing] = useState(false);
+  const [jobs, setJobs] = useState<DocumentJob<{ drafts: PreviewDraft[] }>[]>([]);
   const [dragging, setDragging] = useState(false);
   const [mobileView, setMobileView] = useState<"document" | "data">("data");
   const [selectedLineId, setSelectedLineId] = useState<string | null>(null);
   const [lineFilter, setLineFilter] = useState<"all" | "recognized" | "not_found" | "missing" | "quantity">("all");
   const [error, setError] = useState<string | null>(null);
+  const resumeStarted = useRef(false);
 
   const addFiles = (incoming: File[]) => {
     const supported = ["application/pdf", "image/jpeg", "image/png", "image/webp"];
@@ -86,14 +92,11 @@ export function PurchaseOrderDocumentImport({
   const drop = (event: DragEvent<HTMLDivElement>) => {
     event.preventDefault(); setDragging(false); addFiles([...event.dataTransfer.files]);
   };
-  const process = async () => {
-    setProcessing(true); setError(null);
-    const data = new FormData();
-    files.forEach((file) => data.append("files", file));
-    if (pastedText.trim()) data.append("pasted_text", pastedText);
-    try {
-      const response = await apiUpload<{ drafts: PreviewDraft[] }>(purchaseOrderPreviewPath, data);
-      const recognized = await Promise.all(response.drafts.map(async (draft, index) => {
+  const applyCompletedJobs = async (
+    completed: DocumentJob<{ drafts: PreviewDraft[] }>[],
+  ) => {
+      const responseDrafts = completed.flatMap((job) => job.result?.drafts ?? []);
+      const recognized = await Promise.all(responseDrafts.map(async (draft, index) => {
         const chainName = draft.header.chain_name ?? "";
         let aliases: CustomerAlias[] = [];
         if (chainName.length >= 2) {
@@ -120,6 +123,27 @@ export function PurchaseOrderDocumentImport({
         };
       }));
       setDrafts(recognized);
+  };
+  useEffect(() => {
+    if (resumeStarted.current) return;
+    resumeStarted.current = true;
+    void resumeDocumentJobs<{ drafts: PreviewDraft[] }>(
+      "purchase_order",
+      (response) => setJobs(response.jobs ?? []),
+    ).then((completed) => {
+      if (completed.length) return applyCompletedJobs(completed);
+    }).catch((caught) => setError(documentProcessingError(caught)));
+  });
+  const process = async () => {
+    setProcessing(true); setError(null);
+    try {
+      const completed = await submitDocumentJobs<{ drafts: PreviewDraft[] }>({
+        kind: "purchase_order",
+        files,
+        pastedText,
+        onUpdate: (response) => setJobs(response.jobs ?? []),
+      });
+      await applyCompletedJobs(completed);
     } catch (caught) {
       setError(documentProcessingError(caught));
     } finally {
@@ -302,7 +326,8 @@ export function PurchaseOrderDocumentImport({
     </div>
     {files.length > 0 && <div className="selected-documents">{files.map((file, index) => <span key={`${file.name}-${index}`}>{file.name}<button type="button" onClick={() => setFiles((current) => current.filter((_, itemIndex) => itemIndex !== index))}>×</button></span>)}</div>}
     <label className="notes-field"><span>O pega el texto del pedido</span><textarea rows={10} value={pastedText} onChange={(event) => setPastedText(event.target.value)} placeholder="Pega aquí el contenido completo de la orden…" /></label>
-    <div className="form-actions"><button className="secondary-button" type="button" onClick={onCancel}>Cancelar</button><button className="primary-button" type="button" disabled={processing || (!files.length && !pastedText.trim())} onClick={process}>{processing ? "Procesando documento…" : "Procesar y crear borradores"}</button></div>
+    {jobs.length > 0 && <div className="document-queue-status">{jobs.length} documentos recibidos · {jobs.filter((job) => job.status === "processing").length} procesando · {jobs.filter((job) => job.status === "pending").length} en espera {jobs.filter((job) => job.status === "pending").map((job) => <button className="text-button" type="button" key={job.id} onClick={() => void cancelDocumentJob(job.id)}>Cancelar {job.filename}</button>)}</div>}
+    <div className="form-actions"><button className="secondary-button" type="button" onClick={onCancel}>Cancelar</button><button className="primary-button" type="button" disabled={processing || (!files.length && !pastedText.trim())} onClick={process}>{processing ? "Procesando en cola…" : "Procesar y crear borradores"}</button></div>
   </section>;
 
   return <section className="order-form document-review">
