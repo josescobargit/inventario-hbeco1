@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime
 from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, model_validator
@@ -10,10 +11,7 @@ from app.modules.auth.api.dependencies import CurrentUser
 from app.modules.catalog.infrastructure.models import Product
 from app.modules.dispatches.infrastructure.models import Dispatch, DispatchLine
 from app.modules.incidents.infrastructure.models import Incident
-from app.modules.inventory.infrastructure.models import (
-    InventoryMovement,
-    InventoryPositionModel,
-)
+from app.modules.inventory.infrastructure.models import InventoryPositionModel
 from app.modules.invoices.infrastructure.models import Invoice, InvoiceLine
 
 
@@ -34,6 +32,8 @@ class DispatchLineInput(BaseModel):
 
 class DispatchInput(BaseModel):
     invoice_id: uuid.UUID
+    dispatched_at: datetime | None = None
+    guide_number: str | None = Field(default=None, max_length=100)
     responsible_name: str = Field(min_length=2, max_length=160)
     recipient: str | None = Field(default=None, max_length=160)
     notes: str | None = Field(default=None, max_length=2000)
@@ -91,12 +91,18 @@ def confirm_dispatch(
             status_code=422,
             detail="El despacho contiene productos que no están en la factura.",
         )
+    dispatch_values = {
+        "invoice_id": invoice.id,
+        "guide_number": payload.guide_number,
+        "responsible_name": payload.responsible_name,
+        "recipient": payload.recipient,
+        "notes": payload.notes,
+        "confirmed_by_user_id": user.id,
+    }
+    if payload.dispatched_at is not None:
+        dispatch_values["dispatched_at"] = payload.dispatched_at
     dispatch = Dispatch(
-        invoice_id=invoice.id,
-        responsible_name=payload.responsible_name,
-        recipient=payload.recipient,
-        notes=payload.notes,
-        confirmed_by_user_id=user.id,
+        **dispatch_values,
     )
     db.add(dispatch)
     db.flush()
@@ -120,12 +126,6 @@ def confirm_dispatch(
                 status_code=409,
                 detail=f"{product.sku}: quedan {remaining} unidades pendientes y se intentan reportar {reported}.",
             )
-        legacy_inventory = invoice.inventory_applied_at is None
-        if legacy_inventory and report.dispatched_quantity > position.physical_confirmed:
-            raise HTTPException(
-                status_code=409,
-                detail=f"{product.sku}: el despacho dejaría stock físico negativo.",
-            )
         line = DispatchLine(
             dispatch_id=dispatch.id,
             invoice_line_id=invoice_line.id,
@@ -137,9 +137,7 @@ def confirm_dispatch(
         if report.missing_quantity:
             db.add(
                 Incident(
-                    incident_type=(
-                        "missing_stock" if legacy_inventory else "delivery_issue"
-                    ),
+                    incident_type="delivery_issue",
                     invoice_id=invoice.id,
                     purchase_order_id=invoice.purchase_order_id,
                     product_id=product.id,
@@ -149,37 +147,11 @@ def confirm_dispatch(
                 )
             )
             invoice.incident_status = "open"
-        if legacy_inventory:
-            before = {
-                "physical_confirmed": position.physical_confirmed,
-                "invoiced_not_dispatched": position.invoiced_not_dispatched,
-                "blocked_by_incident": position.blocked_by_incident,
-                "version": position.version,
-            }
-            position.physical_confirmed -= report.dispatched_quantity
-            position.invoiced_not_dispatched -= reported
-            position.blocked_by_incident += report.missing_quantity
-            position.version += 1
-            db.add(
-                InventoryMovement(
-                    warehouse_id=position.warehouse_id,
-                    product_id=product.id,
-                    purchase_order_id=invoice.purchase_order_id,
-                    actor_user_id=user.id,
-                    movement_type="dispatch_confirmed",
-                    reference_type="dispatch",
-                    reference_id=str(dispatch.id),
-                    quantity=reported,
-                    reason=payload.notes or "Despacho confirmado",
-                    before_value=before,
-                    after_value={
-                        "physical_confirmed": position.physical_confirmed,
-                        "invoiced_not_dispatched": position.invoiced_not_dispatched,
-                        "blocked_by_incident": position.blocked_by_incident,
-                        "version": position.version,
-                    },
-                )
-            )
+        # El despacho es seguimiento operativo. Esta columna es informativa y
+        # nunca participa en el saldo disponible ni genera movimientos.
+        position.invoiced_not_dispatched = max(
+            0, position.invoiced_not_dispatched - reported
+        )
     db.flush()
     invoice_total = db.scalar(
         select(func.coalesce(func.sum(InvoiceLine.quantity), 0)).where(

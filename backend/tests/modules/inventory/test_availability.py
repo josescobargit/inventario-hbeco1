@@ -14,10 +14,10 @@ def test_availability_uses_confirmed_formula() -> None:
         blocked_by_incident=5,
     )
 
-    assert position.available_to_invoice == 65
+    assert position.available_to_invoice == 85
 
 
-def test_availability_can_expose_an_inconsistent_negative_balance() -> None:
+def test_informational_pending_dispatch_is_not_deducted_twice() -> None:
     position = InventoryPosition(
         physical_confirmed=10,
         reserved=8,
@@ -25,9 +25,10 @@ def test_availability_can_expose_an_inconsistent_negative_balance() -> None:
         blocked_by_incident=0,
     )
 
-    assert position.available_to_invoice == -3
+    assert position.available_to_invoice == 2
+    position.require_available(1)
     with pytest.raises(InsufficientAvailabilityError):
-        position.require_available(1)
+        position.require_available(3)
 
 
 @pytest.mark.parametrize("quantity", [-1, 1.5, True])

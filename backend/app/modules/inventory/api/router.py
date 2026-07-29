@@ -71,7 +71,10 @@ def movement_delta(
 
 
 def serialize_movement(
-    movement: InventoryMovement, product: Product, user: User | None
+    movement: InventoryMovement,
+    product: Product,
+    user: User | None,
+    invoice: Invoice | None = None,
 ) -> dict[str, Any]:
     affected_field, delta = movement_delta(movement.before_value, movement.after_value)
     return {
@@ -87,6 +90,11 @@ def serialize_movement(
         "quantity": movement.quantity,
         "reference_type": movement.reference_type,
         "reference_id": movement.reference_id,
+        "reference_label": (
+            f"Factura {invoice.invoice_number}" if invoice else movement.reference_type
+        ),
+        "invoice_id": invoice.id if invoice else None,
+        "invoice_number": invoice.invoice_number if invoice else None,
         "purchase_order_id": movement.purchase_order_id,
         "reason": movement.reason,
         "actor": user.full_name if user else "Usuario no disponible",
@@ -213,12 +221,19 @@ def list_movements(
     )
     if search and search.strip():
         term = f"%{search.strip()}%"
+        matching_invoice_ids = [
+            str(value)
+            for value in db.scalars(
+                select(Invoice.id).where(Invoice.invoice_number.ilike(term))
+            ).all()
+        ]
         statement = statement.where(
             or_(
                 Product.sku.ilike(term),
                 Product.name.ilike(term),
                 InventoryMovement.reference_id.ilike(term),
                 InventoryMovement.reason.ilike(term),
+                InventoryMovement.reference_id.in_(matching_invoice_ids),
             )
         )
     if movement_type and movement_type.strip():
@@ -232,10 +247,32 @@ def list_movements(
     if date_to:
         statement = statement.where(InventoryMovement.occurred_at <= date_to)
 
+    rows = db.execute(statement).all()
+    invoice_ids = {
+        uuid.UUID(movement.reference_id)
+        for movement, _, _ in rows
+        if movement.reference_type == "invoice"
+        and movement.reference_id
+        and _is_uuid(movement.reference_id)
+    }
+    invoices = {
+        str(invoice.id): invoice
+        for invoice in db.scalars(select(Invoice).where(Invoice.id.in_(invoice_ids)))
+    }
     return [
-        serialize_movement(movement, product, user)
-        for movement, product, user in db.execute(statement).all()
+        serialize_movement(
+            movement, product, user, invoices.get(movement.reference_id or "")
+        )
+        for movement, product, user in rows
     ]
+
+
+def _is_uuid(value: str) -> bool:
+    try:
+        uuid.UUID(value)
+    except ValueError:
+        return False
+    return True
 
 
 def historical_cutoff(day: date) -> datetime:

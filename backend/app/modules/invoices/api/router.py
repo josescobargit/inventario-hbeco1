@@ -24,6 +24,7 @@ from app.modules.invoices.infrastructure.models import (
     InvoiceAlert,
     InvoiceLine,
 )
+from app.modules.invoices.domain.inventory_audit import audit_invoices
 from app.modules.purchase_orders.infrastructure.models import (
     PurchaseOrder,
     PurchaseOrderLine,
@@ -127,7 +128,9 @@ async def preview_invoice_documents(
     if not files:
         raise HTTPException(status_code=422, detail="Selecciona al menos un documento.")
     if len(files) > 50:
-        raise HTTPException(status_code=422, detail="Procesa hasta 50 documentos por lote.")
+        raise HTTPException(
+            status_code=422, detail="Procesa hasta 50 documentos por lote."
+        )
     documents = []
     for upload in files:
         document = await stream_upload(
@@ -367,26 +370,28 @@ def _register_invoice(
                 ),
             )
         pos.physical_confirmed -= line_input.quantity
+        pos.invoiced_not_dispatched += line_input.quantity
         pos.version += 1
         movement = InventoryMovement(
-                warehouse_id=warehouse.id,
-                product_id=product.id,
-                purchase_order_id=invoice.purchase_order_id,
-                actor_user_id=user.id,
-                movement_type="invoice_registered",
-                reference_type="invoice",
-                reference_id=str(invoice.id),
-                idempotency_key=f"invoice:{payload.invoice_number}:{sku}",
-                batch_id=batch_id,
-                quantity=line_input.quantity,
-                reason="Salida por factura",
-                before_value=before,
-                after_value={
-                    "physical_confirmed": pos.physical_confirmed,
-                    "reserved": pos.reserved,
-                    "version": pos.version,
-                },
-            )
+            warehouse_id=warehouse.id,
+            product_id=product.id,
+            purchase_order_id=invoice.purchase_order_id,
+            actor_user_id=user.id,
+            movement_type="invoice_registered",
+            reference_type="invoice",
+            reference_id=str(invoice.id),
+            idempotency_key=f"invoice:{invoice.id}:{product.id}:confirmed",
+            batch_id=batch_id,
+            quantity=line_input.quantity,
+            reason="Salida por factura",
+            before_value=before,
+            after_value={
+                "physical_confirmed": pos.physical_confirmed,
+                "reserved": pos.reserved,
+                "invoiced_not_dispatched": pos.invoiced_not_dispatched,
+                "version": pos.version,
+            },
+        )
         db.add(movement)
         db.flush()
         inventory_movements.append(movement)
@@ -411,9 +416,7 @@ def _register_invoice(
         ):
             reservation.status = "used"
     invoice.inventory_status = "discounted"
-    invoice.inventory_discounted_quantity = sum(
-        line.quantity for line in payload.lines
-    )
+    invoice.inventory_discounted_quantity = sum(line.quantity for line in payload.lines)
     invoice.inventory_movement_id = (
         inventory_movements[0].id if inventory_movements else None
     )
@@ -645,6 +648,16 @@ def cancel_invoice(
             status_code=409,
             detail="No puede anularse una factura después de iniciar su despacho.",
         )
+    audit = audit_invoices(db, [invoice.id])[0]
+    if audit["status"] in {"duplicate", "over", "error", "product_incorrect"}:
+        raise HTTPException(
+            status_code=409,
+            detail="La factura tiene movimientos inconsistentes y requiere revisión antes de anularse.",
+        )
+    discounted_by_product = {
+        item["product_id"]: max(0, item["discounted"])
+        for item in audit["product_differences"]
+    }
     rows = db.execute(
         select(InvoiceLine, Product, InventoryPositionModel, Warehouse)
         .join(Product, Product.id == InvoiceLine.product_id)
@@ -663,38 +676,38 @@ def cancel_invoice(
             "invoiced_not_dispatched": position.invoiced_not_dispatched,
             "version": position.version,
         }
-        if invoice.inventory_applied_at is not None:
-            position.physical_confirmed += line.quantity
-        else:
-            position.invoiced_not_dispatched = max(
-                0, position.invoiced_not_dispatched - line.quantity
-            )
-        position.version += 1
-        db.add(
-            InventoryMovement(
-                warehouse_id=warehouse.id,
-                product_id=product.id,
-                purchase_order_id=invoice.purchase_order_id,
-                actor_user_id=user.id,
-                movement_type="invoice_cancelled",
-                reference_type="invoice",
-                reference_id=str(invoice.id),
-                idempotency_key=f"invoice-cancel:{invoice.id}:{product.id}",
-                batch_id=invoice.batch_id,
-                quantity=line.quantity,
-                reason="Reversión por anulación de factura",
-                before_value=before,
-                after_value={
-                    "physical_confirmed": position.physical_confirmed,
-                    "invoiced_not_dispatched": position.invoiced_not_dispatched,
-                    "version": position.version,
-                },
-            )
+        reversed_quantity = min(line.quantity, discounted_by_product.get(product.id, 0))
+        position.physical_confirmed += reversed_quantity
+        position.invoiced_not_dispatched = max(
+            0, position.invoiced_not_dispatched - line.quantity
         )
+        position.version += 1
+        if reversed_quantity:
+            db.add(
+                InventoryMovement(
+                    warehouse_id=warehouse.id,
+                    product_id=product.id,
+                    purchase_order_id=invoice.purchase_order_id,
+                    actor_user_id=user.id,
+                    movement_type="invoice_cancelled",
+                    reference_type="invoice",
+                    reference_id=str(invoice.id),
+                    idempotency_key=f"invoice-cancel:{invoice.id}:{product.id}",
+                    batch_id=invoice.batch_id,
+                    quantity=reversed_quantity,
+                    reason="Reversión por anulación de factura",
+                    before_value=before,
+                    after_value={
+                        "physical_confirmed": position.physical_confirmed,
+                        "invoiced_not_dispatched": position.invoiced_not_dispatched,
+                        "version": position.version,
+                    },
+                )
+            )
         inventory_affected.append(
             {
                 "sku": product.sku,
-                "quantity": line.quantity,
+                "quantity": reversed_quantity,
                 "physical_confirmed": position.physical_confirmed,
                 "available_to_invoice": InventoryPosition(
                     position.physical_confirmed,
@@ -746,11 +759,19 @@ def update_invoice(
     if invoice is None:
         raise HTTPException(status_code=404, detail="No encontramos la factura.")
     if invoice.administrative_status != "confirmed":
-        raise HTTPException(status_code=409, detail="La factura anulada no puede editarse.")
+        raise HTTPException(
+            status_code=409, detail="La factura anulada no puede editarse."
+        )
     if invoice.dispatch_status != "pending":
         raise HTTPException(
             status_code=409,
             detail="No se puede editar el detalle porque el despacho ya inició.",
+        )
+    audit = audit_invoices(db, [invoice.id])[0]
+    if audit["status"] != "correct":
+        raise HTTPException(
+            status_code=409,
+            detail="Audita y corrige el inventario de esta factura antes de editarla.",
         )
     duplicate = db.scalar(
         select(Invoice.id).where(
@@ -820,18 +841,14 @@ def update_invoice(
                 )
         if delta:
             before = {"version": position.version}
-            if invoice.inventory_applied_at is not None:
-                before["physical_confirmed"] = position.physical_confirmed
-                position.physical_confirmed -= delta
-            else:
-                before["invoiced_not_dispatched"] = position.invoiced_not_dispatched
-                position.invoiced_not_dispatched += delta
+            before["physical_confirmed"] = position.physical_confirmed
+            before["invoiced_not_dispatched"] = position.invoiced_not_dispatched
+            position.physical_confirmed -= delta
+            position.invoiced_not_dispatched += delta
             position.version += 1
             after = {"version": position.version}
-            if invoice.inventory_applied_at is not None:
-                after["physical_confirmed"] = position.physical_confirmed
-            else:
-                after["invoiced_not_dispatched"] = position.invoiced_not_dispatched
+            after["physical_confirmed"] = position.physical_confirmed
+            after["invoiced_not_dispatched"] = position.invoiced_not_dispatched
             db.add(
                 InventoryMovement(
                     warehouse_id=warehouse.id,
@@ -940,9 +957,7 @@ def update_invoice(
     invoice.total_value = payload.total_value
     invoice.notes = payload.notes
     invoice.inventory_status = "discounted"
-    invoice.inventory_discounted_quantity = sum(
-        line.quantity for line in payload.lines
-    )
+    invoice.inventory_discounted_quantity = sum(line.quantity for line in payload.lines)
     invoice.inventory_last_error = None
     invoice.inventory_attempts += 1
     db.add(

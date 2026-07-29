@@ -15,6 +15,9 @@ interface Movement {
   delta: number;
   reference_type: string | null;
   reference_id: string | null;
+  reference_label: string | null;
+  invoice_id: string | null;
+  invoice_number: string | null;
   reason: string;
   actor: string;
   before_value: Record<string, number | string | null>;
@@ -24,7 +27,7 @@ interface Movement {
 const FIELD_LABELS: Record<string, string> = {
   physical_confirmed: "Físico confirmado",
   reserved: "Reservado",
-  invoiced_not_dispatched: "Facturado pendiente",
+  invoiced_not_dispatched: "Facturado por despachar",
   blocked_by_incident: "Bloqueado por incidencia",
   sin_cambio: "Sin cambio",
 };
@@ -134,7 +137,7 @@ export function MovementCenter() {
             <td>{FIELD_LABELS[item.affected_field] ?? item.affected_field}</td>
             <td><strong className={item.delta < 0 ? "negative-delta" : item.delta > 0 ? "positive-delta" : undefined}>{item.delta > 0 ? `+${item.delta}` : item.delta}</strong></td>
             <td>{item.actor}</td>
-            <td><strong>{item.reference_type ?? "—"}</strong><span>{item.reference_id ?? "Sin referencia"}</span></td>
+            <td><strong>{item.reference_label ?? item.reference_type ?? "—"}</strong><span>{item.reference_id ?? "Sin referencia interna"}</span>{item.invoice_id && <button type="button" className="link-button" onClick={(event) => { event.stopPropagation(); sessionStorage.setItem("inventario.openInvoiceId", item.invoice_id!); window.dispatchEvent(new CustomEvent("inventario:navigate", { detail: "invoices" })); }}>Abrir factura</button>}</td>
             <td className="reason-cell">{item.reason}</td>
           </tr>)}</tbody>
         </table></div>}
@@ -149,7 +152,7 @@ export function MovementCenter() {
             <div><dt>Fecha</dt><dd>{dateLabel(selectedMovement.occurred_at)}</dd></div>
             <div><dt>Responsable</dt><dd>{selectedMovement.actor}</dd></div>
             <div><dt>Campo afectado</dt><dd>{FIELD_LABELS[selectedMovement.affected_field] ?? selectedMovement.affected_field}</dd></div>
-            <div><dt>Referencia</dt><dd>{selectedMovement.reference_type ?? "—"} · {selectedMovement.reference_id ?? "Sin referencia"}</dd></div>
+            <div><dt>Referencia</dt><dd>{selectedMovement.reference_label ?? selectedMovement.reference_type ?? "—"}<small>{selectedMovement.reference_id ?? "Sin referencia interna"}</small></dd></div>
           </dl>
           <div className="before-after-grid">
             <div><span>Antes</span><strong>{selectedMovement.before_value[selectedMovement.affected_field] ?? "—"}</strong></div>
