@@ -12,6 +12,7 @@ from app.core.database import get_db
 from app.core.time import utc_now
 from app.modules.audit.infrastructure.models import AuditLog
 from app.modules.auth.api.dependencies import CurrentUser
+from app.modules.auth.infrastructure.models import User
 from app.modules.catalog.infrastructure.models import Product
 from app.modules.inventory.infrastructure.models import (
     InventoryMovement,
@@ -54,7 +55,7 @@ def _pending_status(invoice: Invoice, audit: dict) -> str:
     if (
         invoice.inventory_status == "error"
         or invoice.inventory_last_error
-        or audit["status"] in {"error", "duplicate", "over"}
+        or audit["status"] in {"error", "duplicate", "over", "product_incorrect"}
     ):
         return "error"
     if audit["status"] == "missing":
@@ -66,6 +67,15 @@ def _pending_status(invoice: Invoice, audit: dict) -> str:
 def invoice_inventory_audit(
     _user: CurrentUser,
     db: Annotated[Session, Depends(get_db)],
+    search: Annotated[str | None, Query(max_length=100)] = None,
+    chain: Annotated[str | None, Query(max_length=160)] = None,
+    product: Annotated[str | None, Query(max_length=160)] = None,
+    status: Annotated[str | None, Query(max_length=40)] = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    problems_only: bool = False,
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=10, le=100)] = 25,
 ) -> dict:
     items = audit_invoices(db)
     product_ids = {
@@ -79,31 +89,225 @@ def invoice_inventory_audit(
             select(Product).where(Product.id.in_(product_ids))
         ).all()
     }
-    return {
-        "summary": audit_summary(items),
-        "items": [
+    position_rows = db.execute(
+        select(InventoryPositionModel)
+        .join(Warehouse, Warehouse.id == InventoryPositionModel.warehouse_id)
+        .where(
+            InventoryPositionModel.product_id.in_(product_ids),
+            Warehouse.code == "principal",
+        )
+    ).scalars()
+    positions = {position.product_id: position for position in position_rows}
+    invoice_ids = [item["id"] for item in items]
+    metadata_rows = db.execute(
+        select(Invoice, PurchaseOrder.order_number)
+        .outerjoin(PurchaseOrder, PurchaseOrder.id == Invoice.purchase_order_id)
+        .where(Invoice.id.in_(invoice_ids))
+    ).all()
+    metadata = {
+        invoice.id: (invoice, order_number) for invoice, order_number in metadata_rows
+    }
+    movement_ids = {
+        movement_id
+        for item in items
+        for difference in item["product_differences"]
+        for movement_id in difference["movement_ids"]
+    }
+    movement_rows = (
+        db.execute(
+            select(InventoryMovement, User)
+            .outerjoin(User, User.id == InventoryMovement.actor_user_id)
+            .where(InventoryMovement.id.in_(movement_ids))
+        ).all()
+        if movement_ids
+        else []
+    )
+    movements = {
+        movement.id: {
+            "id": movement.id,
+            "occurred_at": movement.occurred_at,
+            "responsible": user.full_name if user else "Usuario no disponible",
+            "movement_type": movement.movement_type,
+            "reason": movement.reason,
+            "quantity": movement.quantity,
+            "net_inventory_effect": (
+                int(movement.after_value.get("physical_confirmed", 0))
+                - int(movement.before_value.get("physical_confirmed", 0))
+            ),
+        }
+        for movement, user in movement_rows
+    }
+
+    enriched = []
+    for item in items:
+        invoice, order_number = metadata[item["id"]]
+        product_rows = []
+        for difference in item["product_differences"]:
+            catalog_product = products.get(difference["product_id"])
+            if difference["expected"] == 0 and difference["discounted"] != 0:
+                product_status = "product_incorrect"
+            elif difference["difference"] == 0:
+                product_status = "correct"
+            elif difference["discounted"] == 0:
+                product_status = "missing"
+            elif difference["discounted"] > difference["expected"]:
+                product_status = (
+                    "duplicate" if difference["outbound_movements"] > 1 else "over"
+                )
+            else:
+                product_status = "quantity_incorrect"
+            product_rows.append(
+                {
+                    **difference,
+                    "product_name": (
+                        catalog_product.name
+                        if catalog_product
+                        else "Producto no disponible"
+                    ),
+                    "sku": catalog_product.sku if catalog_product else "—",
+                    "expected_movement": -difference["expected"],
+                    "found_movement": -difference["discounted"],
+                    "pending_units": max(0, difference["difference"]),
+                    "excess_units": max(0, -difference["difference"]),
+                    "status": product_status,
+                    "status_label": {
+                        "correct": "Correcto",
+                        "missing": "Sin descontar",
+                        "quantity_incorrect": "Cantidad incorrecta",
+                        "over": "Descuento excesivo",
+                        "duplicate": "Movimiento duplicado",
+                        "product_incorrect": "Producto incorrecto",
+                    }[product_status],
+                    "movements": [
+                        movements[movement_id]
+                        for movement_id in difference["movement_ids"]
+                        if movement_id in movements
+                    ],
+                    "inventory_current": (
+                        positions[difference["product_id"]].physical_confirmed
+                        if difference["product_id"] in positions
+                        else None
+                    ),
+                }
+            )
+        enriched.append(
             {
                 **_public_audit(item),
-                "products": [
-                    {
-                        **difference,
-                        "product_name": (
-                            products[difference["product_id"]].name
-                            if difference["product_id"] in products
-                            else "Producto no disponible"
-                        ),
-                        "sku": (
-                            products[difference["product_id"]].sku
-                            if difference["product_id"] in products
-                            else "—"
-                        ),
-                        "pending_units": max(0, difference["difference"]),
-                    }
-                    for difference in item["product_differences"]
-                ],
+                "customer_name": invoice.customer_name,
+                "chain_name": invoice.chain_name,
+                "purchase_order_id": invoice.purchase_order_id,
+                "purchase_order_number": order_number,
+                "dispatch_status": invoice.dispatch_status,
+                "product_count": len(
+                    [row for row in product_rows if row["expected"] > 0]
+                ),
+                "pending_units": sum(row["pending_units"] for row in product_rows),
+                "excess_units": sum(row["excess_units"] for row in product_rows),
+                "products": product_rows,
             }
-            for item in items
-        ],
+        )
+
+    if search and search.strip():
+        value = search.strip().lower()
+        enriched = [
+            item
+            for item in enriched
+            if value in item["invoice_number"].lower()
+            or value in (item["purchase_order_number"] or "").lower()
+        ]
+    if chain and chain.strip():
+        value = chain.strip().lower()
+        enriched = [
+            item
+            for item in enriched
+            if value in (item["chain_name"] or item["customer_name"] or "").lower()
+        ]
+    if product and product.strip():
+        value = product.strip().lower()
+        enriched = [
+            item
+            for item in enriched
+            if any(
+                value in row["product_name"].lower() or value in row["sku"].lower()
+                for row in item["products"]
+            )
+        ]
+    if status:
+        enriched = [item for item in enriched if item["status"] == status]
+    if date_from:
+        enriched = [item for item in enriched if item["invoice_date"] >= date_from]
+    if date_to:
+        enriched = [item for item in enriched if item["invoice_date"] <= date_to]
+    if problems_only:
+        enriched = [
+            item
+            for item in enriched
+            if item["status"] not in {"correct", "cancelled_correct"}
+        ]
+
+    all_invoice_references = {
+        reference
+        for invoice, _ in metadata_rows
+        for reference in (str(invoice.id), invoice.invoice_number)
+    }
+    orphan_rows = db.execute(
+        select(InventoryMovement, Product, User)
+        .join(Product, Product.id == InventoryMovement.product_id)
+        .outerjoin(User, User.id == InventoryMovement.actor_user_id)
+        .where(
+            InventoryMovement.reference_type == "invoice",
+            InventoryMovement.status == "confirmed",
+        )
+    ).all()
+    orphan_movements = [
+        {
+            "id": movement.id,
+            "reference": movement.reference_id,
+            "occurred_at": movement.occurred_at,
+            "product_name": catalog_product.name,
+            "sku": catalog_product.sku,
+            "responsible": user.full_name if user else "Usuario no disponible",
+            "net_inventory_effect": (
+                int(movement.after_value.get("physical_confirmed", 0))
+                - int(movement.before_value.get("physical_confirmed", 0))
+            ),
+            "status": "movement_without_invoice",
+            "status_label": "Movimiento sin factura",
+        }
+        for movement, catalog_product, user in orphan_rows
+        if (movement.reference_id or "") not in all_invoice_references
+    ]
+    summary = audit_summary(enriched)
+    summary.update(
+        {
+            "problem_invoices": sum(
+                item["status"] not in {"correct", "cancelled_correct"}
+                for item in enriched
+            ),
+            "excess_or_duplicate": sum(
+                item["status"] in {"over", "duplicate"} for item in enriched
+            ),
+            "cancelled_incorrect": sum(
+                item["status"] == "cancelled_missing_reversal" for item in enriched
+            ),
+            "requires_review": sum(
+                item["status"] in {"error", "product_incorrect"} for item in enriched
+            )
+            + len(orphan_movements),
+            "pending_units": sum(item["pending_units"] for item in enriched),
+            "excess_units": sum(item["excess_units"] for item in enriched),
+            "orphan_movements": len(orphan_movements),
+        }
+    )
+    total = len(enriched)
+    start = (page - 1) * page_size
+    return {
+        "summary": summary,
+        "items": enriched[start : start + page_size],
+        "total": total,
+        "page": page,
+        "pages": max(1, (total + page_size - 1) // page_size),
+        "orphan_movements": orphan_movements,
         "read_only": True,
         "generated_at": datetime.now(timezone.utc),
     }
@@ -294,21 +498,57 @@ def correction_preview(
     safe = [
         item
         for item in audited
-        if item["status"] in {"missing", "partial"}
-        and item["administrative_status"] != "cancelled"
+        if (
+            item["status"] in {"missing", "partial"}
+            and item["administrative_status"] != "cancelled"
+        )
+        or (
+            item["status"] == "cancelled_missing_reversal"
+            and all(
+                0 <= difference["discounted"] <= difference["expected"]
+                for difference in item["product_differences"]
+            )
+        )
+        or (
+            item["status"] == "over"
+            and all(
+                difference["outbound_movements"] <= 1
+                for difference in item["product_differences"]
+            )
+        )
     ]
     blocked = [
         item
         for item in audited
-        if item["status"]
-        in {"duplicate", "over", "cancelled_missing_reversal", "error"}
+        if item["status"] in {"duplicate", "error", "product_incorrect"}
+        or (
+            item["status"] == "over"
+            and any(
+                difference["outbound_movements"] > 1
+                for difference in item["product_differences"]
+            )
+        )
+        or (
+            item["status"] == "cancelled_missing_reversal"
+            and any(
+                difference["discounted"] < 0
+                or difference["discounted"] > difference["expected"]
+                for difference in item["product_differences"]
+            )
+        )
     ]
     return {
         "correctable": [
             {
                 **_public_audit(item),
                 "units_to_discount": sum(
-                    max(0, difference["difference"])
+                    (
+                        max(0, difference["discounted"])
+                        if item["status"] == "cancelled_missing_reversal"
+                        else max(0, -difference["difference"])
+                        if item["status"] == "over"
+                        else max(0, difference["difference"])
+                    )
                     for difference in item["product_differences"]
                 ),
             }
@@ -339,11 +579,18 @@ def correct_pending_movements(
             continue
         fresh = audit_invoices(db, [invoice.id])[0]
         invoice.inventory_attempts += 1
+        is_reversal = fresh["status"] == "cancelled_missing_reversal" and all(
+            0 <= item["discounted"] <= item["expected"]
+            for item in fresh["product_differences"]
+        )
+        is_excess_reversal = fresh["status"] == "over" and all(
+            item["outbound_movements"] <= 1 for item in fresh["product_differences"]
+        )
         if (
             fresh["status"] not in {"missing", "partial"}
-            or invoice.administrative_status == "cancelled"
-            or invoice.inventory_status == "processing"
-        ):
+            and not is_reversal
+            and not is_excess_reversal
+        ) or invoice.inventory_status == "processing":
             invoice.inventory_status = stored_inventory_status(fresh["status"])
             invoice.inventory_last_error = (
                 None
@@ -361,7 +608,25 @@ def correct_pending_movements(
             )
             continue
         differences = [
-            item for item in fresh["product_differences"] if item["difference"] > 0
+            {
+                **item,
+                "difference": (
+                    item["discounted"]
+                    if is_reversal
+                    else -item["difference"]
+                    if is_excess_reversal
+                    else item["difference"]
+                ),
+            }
+            for item in fresh["product_differences"]
+            if (
+                item["discounted"]
+                if is_reversal
+                else -item["difference"]
+                if is_excess_reversal
+                else item["difference"]
+            )
+            > 0
         ]
         product_ids = [item["product_id"] for item in differences]
         position_rows = db.execute(
@@ -386,8 +651,12 @@ def correct_pending_movements(
                 item
                 for item in differences
                 if item["product_id"] not in positions
-                or positions[item["product_id"]][1].physical_confirmed
-                < item["difference"]
+                or (
+                    not is_reversal
+                    and not is_excess_reversal
+                    and positions[item["product_id"]][1].physical_confirmed
+                    < item["difference"]
+                )
             ),
             None,
         )
@@ -419,27 +688,51 @@ def correct_pending_movements(
                 product, position, warehouse = positions[difference["product_id"]]
                 before = {
                     "physical_confirmed": position.physical_confirmed,
+                    "invoiced_not_dispatched": position.invoiced_not_dispatched,
                     "version": position.version,
                 }
-                position.physical_confirmed -= difference["difference"]
+                position.physical_confirmed += (
+                    difference["difference"]
+                    if is_reversal or is_excess_reversal
+                    else -difference["difference"]
+                )
+                if is_reversal:
+                    position.invoiced_not_dispatched = max(
+                        0,
+                        position.invoiced_not_dispatched - difference["expected"],
+                    )
+                else:
+                    position.invoiced_not_dispatched += difference["difference"]
                 position.version += 1
                 movement = InventoryMovement(
                     warehouse_id=warehouse.id,
                     product_id=product.id,
                     purchase_order_id=invoice.purchase_order_id,
                     actor_user_id=user.id,
-                    movement_type="invoice_inventory_correction",
+                    movement_type=(
+                        "invoice_cancelled"
+                        if is_reversal
+                        else "invoice_inventory_correction"
+                    ),
                     reference_type="invoice",
                     reference_id=str(invoice.id),
                     idempotency_key=(
-                        f"invoice-correction:{invoice.id}:{product.id}:"
+                        f"invoice-{'audit-reversal' if is_reversal else 'excess-reversal' if is_excess_reversal else 'correction'}:"
+                        f"{invoice.id}:{product.id}:"
                         f"{difference['expected']}"
                     ),
                     quantity=difference["difference"],
-                    reason=f"Corrección auditada: {payload.reason}",
+                    reason=(
+                        f"Reversión auditada de factura anulada: {payload.reason}"
+                        if is_reversal
+                        else f"Reversión auditada de exceso: {payload.reason}"
+                        if is_excess_reversal
+                        else f"Corrección auditada: {payload.reason}"
+                    ),
                     before_value=before,
                     after_value={
                         "physical_confirmed": position.physical_confirmed,
+                        "invoiced_not_dispatched": position.invoiced_not_dispatched,
                         "version": position.version,
                     },
                 )
@@ -453,14 +746,18 @@ def correct_pending_movements(
                         "available_to_invoice": (
                             position.physical_confirmed
                             - position.reserved
-                            - position.invoiced_not_dispatched
                             - position.blocked_by_incident
                         ),
                     }
                 )
-            invoice.inventory_status = "discounted"
-            invoice.inventory_discounted_quantity = fresh["invoiced_units"]
-            invoice.inventory_applied_at = invoice.inventory_applied_at or utc_now()
+            invoice.inventory_status = "reverted" if is_reversal else "discounted"
+            invoice.inventory_discounted_quantity = (
+                0 if is_reversal else fresh["invoiced_units"]
+            )
+            if is_reversal:
+                invoice.inventory_reversed_at = utc_now()
+            else:
+                invoice.inventory_applied_at = invoice.inventory_applied_at or utc_now()
             invoice.inventory_movement_id = (
                 created_movements[0].id
                 if created_movements
@@ -479,8 +776,10 @@ def correct_pending_movements(
                         "discounted_units": fresh["discounted_units"],
                     },
                     new_value={
-                        "status": "correct",
-                        "discounted_units": fresh["invoiced_units"],
+                        "status": ("cancelled_correct" if is_reversal else "correct"),
+                        "discounted_units": (
+                            0 if is_reversal else fresh["invoiced_units"]
+                        ),
                         "movement_ids": [
                             str(movement.id) for movement in created_movements
                         ],
@@ -634,7 +933,13 @@ def invoice_listing(
         audit = audited[invoice.id]
         if inventory_status:
             accepted_statuses = (
-                {"error", "duplicate", "over", "cancelled_missing_reversal"}
+                {
+                    "error",
+                    "duplicate",
+                    "over",
+                    "product_incorrect",
+                    "cancelled_missing_reversal",
+                }
                 if inventory_status == "error"
                 else {inventory_status}
             )
@@ -691,9 +996,7 @@ def invoice_listing(
         else audit_invoices(db)
     )
     active_audit = [
-        item
-        for item in complete_audit
-        if item["administrative_status"] != "cancelled"
+        item for item in complete_audit if item["administrative_status"] != "cancelled"
     ]
     return {
         "items": page_items,
@@ -707,13 +1010,12 @@ def invoice_listing(
             "missing": sum(item["status"] == "missing" for item in active_audit),
             "partial": sum(item["status"] == "partial" for item in active_audit),
             "errors": sum(
-                item["status"] in {"error", "duplicate", "over"}
+                item["status"] in {"error", "duplicate", "over", "product_incorrect"}
                 for item in active_audit
             ),
             "discounted": sum(item["status"] == "correct" for item in active_audit),
             "cancelled": sum(
-                item["administrative_status"] == "cancelled"
-                for item in complete_audit
+                item["administrative_status"] == "cancelled" for item in complete_audit
             ),
             "pending_units": sum(
                 max(0, difference["difference"])

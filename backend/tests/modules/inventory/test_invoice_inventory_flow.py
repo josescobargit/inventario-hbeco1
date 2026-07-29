@@ -109,7 +109,7 @@ def test_confirmed_invoice_deducts_once_and_retry_is_idempotent(
     ).all()
 
     assert position.physical_confirmed == 88
-    assert position.invoiced_not_dispatched == 0
+    assert position.invoiced_not_dispatched == 12
     assert created["delivery_status"] == "pending"
     assert created["inventory_affected"][0]["physical_confirmed"] == 88
     assert retried["duplicate"] is True
@@ -223,13 +223,17 @@ def test_dispatch_and_later_delivery_do_not_deduct_again(inventory_db) -> None:
     assert dispatch["dispatch_status"] == "complete"
     assert delivery["delivery_status"] == "delivered_confirmed"
     assert position.physical_confirmed == 90
+    assert position.invoiced_not_dispatched == 0
     assert trace["lines"][0]["pending_confirmation"] == 2
     assert trace["lines"][0]["delivery_difference"] == -2
-    assert db.scalar(
-        select(func.count(InventoryMovement.id)).where(
-            InventoryMovement.movement_type == "dispatch_confirmed"
+    assert (
+        db.scalar(
+            select(func.count(InventoryMovement.id)).where(
+                InventoryMovement.movement_type == "dispatch_confirmed"
+            )
         )
-    ) == 0
+        == 0
+    )
 
 
 def test_return_creates_its_own_entry_related_to_delivery(inventory_db) -> None:

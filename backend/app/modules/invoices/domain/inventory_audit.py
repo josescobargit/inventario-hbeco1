@@ -10,13 +10,14 @@ from app.modules.invoices.infrastructure.models import Invoice, InvoiceLine
 
 
 STATUS_LABELS = {
-    "correct": "Descontada correctamente",
-    "missing": "Sin descontar",
-    "partial": "Descuento parcial",
+    "correct": "Descontado",
+    "missing": "Pendiente de descontar",
+    "partial": "Parcial",
     "duplicate": "Descuento duplicado",
     "over": "Movimiento superior a la factura",
-    "cancelled_correct": "Anulada correctamente",
+    "cancelled_correct": "Revertido",
     "cancelled_missing_reversal": "Anulada sin reversión",
+    "product_incorrect": "Producto incorrecto",
     "error": "Error",
 }
 
@@ -52,8 +53,14 @@ def audit_invoices(
     for line in db.scalars(
         select(InvoiceLine).where(InvoiceLine.invoice_id.in_(invoice_ids_loaded))
     ):
-        lines_by_invoice[line.invoice_id][line.product_id] = line.quantity
-    id_lookup = {str(invoice.id): invoice.id for invoice in invoices}
+        lines_by_invoice[line.invoice_id][line.product_id] = (
+            lines_by_invoice[line.invoice_id].get(line.product_id, 0) + line.quantity
+        )
+    id_lookup = {
+        reference: invoice.id
+        for invoice in invoices
+        for reference in (str(invoice.id), invoice.invoice_number)
+    }
     movements_by_invoice: dict[uuid.UUID, list[InventoryMovement]] = defaultdict(list)
     movements = db.scalars(
         select(InventoryMovement)
@@ -99,6 +106,11 @@ def audit_invoices(
                 "difference": expected_by_product.get(product_id, 0)
                 - net_by_product.get(product_id, 0),
                 "outbound_movements": positive_count.get(product_id, 0),
+                "movement_ids": [
+                    movement.id
+                    for movement in physical_movements
+                    if movement.product_id == product_id
+                ],
             }
             for product_id in set(expected_by_product) | set(net_by_product)
         ]
@@ -112,6 +124,11 @@ def audit_invoices(
                 status = "cancelled_missing_reversal"
         elif not expected_by_product:
             status = "error"
+        elif any(
+            item["expected"] == 0 and item["discounted"] != 0
+            for item in product_differences
+        ):
+            status = "product_incorrect"
         elif any(item["discounted"] > item["expected"] for item in product_differences):
             status = (
                 "duplicate"
@@ -170,6 +187,9 @@ def audit_summary(items: list[dict[str, Any]]) -> dict[str, int]:
         ),
         "cancelled_missing_reversal": sum(
             item["status"] == "cancelled_missing_reversal" for item in items
+        ),
+        "product_incorrect": sum(
+            item["status"] == "product_incorrect" for item in items
         ),
         "errors": sum(item["status"] == "error" for item in items),
     }

@@ -27,7 +27,7 @@ export function OperationalOverview({ onNavigate }: { onNavigate: (module: Modul
       <button type="button" onClick={() => onNavigate("inventory")}><span>Disponible para facturar</span><strong>{summary.inventory.available}</strong><small>Unidades disponibles</small></button>
       <button type="button" onClick={() => onNavigate("inventory")}><span>Stock físico</span><strong>{summary.inventory.physical}</strong><small>{summary.inventory.products} productos</small></button>
       <button type="button" onClick={() => onNavigate("reservations")}><span>Reservado</span><strong>{summary.inventory.reserved}</strong><small>{summary.workflow.active_reservations} reservas activas</small></button>
-      <button type="button" onClick={() => onNavigate("dispatches")}><span>Facturado pendiente</span><strong>{summary.inventory.invoiced_pending}</strong><small>{summary.workflow.pending_dispatch} por despachar</small></button>
+      <button type="button" onClick={() => onNavigate("dispatches")}><span>Facturado por despachar</span><strong>{summary.inventory.invoiced_pending}</strong><small>{summary.workflow.pending_dispatch} por despachar</small></button>
       <button className={summary.inventory.blocked > 0 ? "attention" : ""} type="button" onClick={() => onNavigate("deliveries")}><span>Bloqueado</span><strong>{summary.inventory.blocked}</strong><small>{summary.workflow.open_incidents} incidencias</small></button>
       <button className={summary.workflow.open_incidents > 0 ? "attention" : ""} type="button" onClick={() => onNavigate("deliveries")}><span>Incidencias</span><strong>{summary.workflow.open_incidents}</strong><small>Abiertas</small></button>
     </section>

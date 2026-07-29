@@ -17,12 +17,7 @@ class InventoryPosition:
 
     @property
     def available_to_invoice(self) -> int:
-        return (
-            self.physical_confirmed
-            - self.reserved
-            - self.invoiced_not_dispatched
-            - self.blocked_by_incident
-        )
+        return self.physical_confirmed - self.reserved - self.blocked_by_incident
 
     def require_available(self, quantity: int) -> None:
         if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity <= 0:

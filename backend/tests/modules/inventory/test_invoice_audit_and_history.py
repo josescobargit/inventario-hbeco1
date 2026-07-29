@@ -21,6 +21,7 @@ from app.modules.invoices.api.audit_router import (
     CorrectionInput,
     correct_pending_movements,
     correction_preview,
+    invoice_inventory_audit,
     invoice_listing,
     pending_inventory_invoices,
 )
@@ -126,6 +127,80 @@ def test_audit_classifies_correct_missing_partial_and_duplicate() -> None:
     db.close()
 
 
+def test_complete_audit_detects_wrong_product_and_orphan_movement_read_only() -> None:
+    _engine, db, user, warehouse, product, position = database()
+    other = Product(
+        sku="AUD-2",
+        name="Producto equivocado",
+        category="Auditoría",
+        cost=Decimal("1"),
+        units_per_box=1,
+    )
+    db.add(other)
+    db.flush()
+    db.add(
+        InventoryPositionModel(
+            warehouse_id=warehouse.id,
+            product_id=other.id,
+            physical_confirmed=100,
+            reserved=0,
+            invoiced_not_dispatched=0,
+            blocked_by_incident=0,
+        )
+    )
+    created = register_invoice(payload(30), user, db, "audit-wrong-product")
+    movement = movement_for(db, created["id"], "invoice_registered")
+    movement.product_id = other.id
+    db.add(
+        InventoryMovement(
+            warehouse_id=warehouse.id,
+            product_id=product.id,
+            actor_user_id=user.id,
+            movement_type="invoice_registered",
+            reference_type="invoice",
+            reference_id=str(uuid.uuid4()),
+            quantity=3,
+            reason="Movimiento huérfano simulado",
+            before_value={"physical_confirmed": 500},
+            after_value={"physical_confirmed": 497},
+        )
+    )
+    db.commit()
+    movement_count = len(db.scalars(select(InventoryMovement)).all())
+    physical_before = position.physical_confirmed
+
+    result = invoice_inventory_audit(user, db)
+
+    db.refresh(position)
+    audited = next(item for item in result["items"] if item["id"] == created["id"])
+    assert result["read_only"] is True
+    assert audited["status"] == "product_incorrect"
+    assert {item["status"] for item in audited["products"]} == {
+        "missing",
+        "product_incorrect",
+    }
+    assert result["summary"]["orphan_movements"] == 1
+    assert result["orphan_movements"][0]["status"] == "movement_without_invoice"
+    assert len(db.scalars(select(InventoryMovement)).all()) == movement_count
+    assert position.physical_confirmed == physical_before
+    db.close()
+
+
+def test_exact_visible_invoice_number_links_legacy_movement() -> None:
+    _engine, db, user, _warehouse, _product, _position = database()
+    created = register_invoice(payload(31), user, db, "audit-visible-reference")
+    movement = movement_for(db, created["id"], "invoice_registered")
+    movement.reference_id = created["invoice_number"]
+    db.commit()
+
+    result = invoice_inventory_audit(user, db)
+
+    audited = next(item for item in result["items"] if item["id"] == created["id"])
+    assert audited["status"] == "correct"
+    assert result["summary"]["orphan_movements"] == 0
+    db.close()
+
+
 def test_cancelled_invoice_requires_and_recognizes_reversal() -> None:
     _engine, db, user, _warehouse, _product, _position = database()
     corrected = register_invoice(payload(5), user, db, "audit-5")
@@ -143,6 +218,48 @@ def test_cancelled_invoice_requires_and_recognizes_reversal() -> None:
     by_number = {item["invoice_number"]: item["status"] for item in audit_invoices(db)}
     assert by_number[corrected["invoice_number"]] == "cancelled_correct"
     assert by_number[missing_reversal["invoice_number"]] == "cancelled_missing_reversal"
+    db.close()
+
+
+def test_audit_correction_reverses_cancelled_invoice_once() -> None:
+    _engine, db, user, _warehouse, _product, position = database()
+    created = register_invoice(payload(9, 10), user, db, "audit-9")
+    cancel_invoice(created["id"], user, db)
+    db.execute(
+        delete(InventoryMovement).where(
+            InventoryMovement.reference_id == str(created["id"]),
+            InventoryMovement.movement_type == "invoice_cancelled",
+        )
+    )
+    position.physical_confirmed -= 10
+    db.commit()
+
+    preview = correction_preview(user, db)
+    assert preview["correctable"][0]["units_to_discount"] == 10
+    first = correct_pending_movements(
+        CorrectionInput(
+            confirmation="CORREGIR",
+            invoice_ids=[created["id"]],
+            reason="Reponer factura anulada histórica",
+        ),
+        user,
+        db,
+    )
+    second = correct_pending_movements(
+        CorrectionInput(
+            confirmation="CORREGIR",
+            invoice_ids=[created["id"]],
+            reason="Reintento de reversión histórica",
+        ),
+        user,
+        db,
+    )
+
+    db.refresh(position)
+    assert first["corrected"] == 1
+    assert second["corrected"] == 0
+    assert position.physical_confirmed == 500
+    assert audit_invoices(db, [created["id"]])[0]["status"] == "cancelled_correct"
     db.close()
 
 
@@ -225,6 +342,51 @@ def test_partial_correction_applies_only_delta_and_audit_preview_is_read_only() 
     db.refresh(position)
     assert result["results"][0]["units_discounted"] == 7
     assert position.physical_confirmed == 488
+    assert audit_invoices(db, [created["id"]])[0]["status"] == "correct"
+    db.close()
+
+
+def test_confirmed_excess_is_reversed_only_after_explicit_confirmation() -> None:
+    _engine, db, user, _warehouse, _product, position = database()
+    created = register_invoice(payload(32, 10), user, db, "audit-excess")
+    movement = movement_for(db, created["id"], "invoice_registered")
+    movement.after_value = {
+        **movement.after_value,
+        "physical_confirmed": movement.before_value["physical_confirmed"] - 15,
+    }
+    position.physical_confirmed -= 5
+    db.commit()
+
+    preview = correction_preview(user, db)
+    proposed = next(
+        item for item in preview["correctable"] if item["id"] == created["id"]
+    )
+    assert proposed["units_to_discount"] == 5
+    assert position.physical_confirmed == 485
+
+    first = correct_pending_movements(
+        CorrectionInput(
+            confirmation="CORREGIR",
+            invoice_ids=[created["id"]],
+            reason="Revertir exceso confirmado",
+        ),
+        user,
+        db,
+    )
+    second = correct_pending_movements(
+        CorrectionInput(
+            confirmation="CORREGIR",
+            invoice_ids=[created["id"]],
+            reason="Reintento sin duplicar reversión",
+        ),
+        user,
+        db,
+    )
+
+    db.refresh(position)
+    assert first["corrected"] == 1
+    assert second["corrected"] == 0
+    assert position.physical_confirmed == 490
     assert audit_invoices(db, [created["id"]])[0]["status"] == "correct"
     db.close()
 

@@ -8,7 +8,7 @@ describe("DispatchCenter", () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify([]), { status: 200, headers: { "Content-Type": "application/json" } })));
     render(<DispatchCenter />);
     expect(screen.getByRole("heading", { name: "Despachos" })).toBeVisible();
-    expect(screen.getByText(/los faltantes quedan bloqueados/i)).toBeVisible();
+    expect(screen.getByText(/el inventario ya fue descontado/i)).toBeVisible();
     expect(await screen.findByText(/no hay facturas pendientes/i)).toBeVisible();
   });
 });

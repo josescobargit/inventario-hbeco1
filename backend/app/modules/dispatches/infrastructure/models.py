@@ -24,6 +24,7 @@ class Dispatch(Base):
         DateTime(timezone=True), default=utc_now, nullable=False, index=True
     )
     responsible_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    guide_number: Mapped[str | None] = mapped_column(String(100))
     recipient: Mapped[str | None] = mapped_column(String(160))
     notes: Mapped[str | None] = mapped_column(Text)
     confirmed_by_user_id: Mapped[uuid.UUID] = mapped_column(

@@ -15,6 +15,8 @@ export function DispatchCenter() {
   const [trace, setTrace] = useState<Trace | null>(null);
   const [reports, setReports] = useState<DispatchLine[]>([]);
   const [responsible, setResponsible] = useState("");
+  const [dispatchDate, setDispatchDate] = useState("");
+  const [guideNumber, setGuideNumber] = useState("");
   const [recipient, setRecipient] = useState("");
   const [notes, setNotes] = useState("");
   const [loading, setLoading] = useState(true);
@@ -29,7 +31,12 @@ export function DispatchCenter() {
   };
 
   useEffect(() => {
-    apiRequest<PendingInvoice[]>("/dispatches/pending").then((data) => { setPending(data); setSelectedId(data[0]?.id ?? null); })
+    apiRequest<PendingInvoice[]>("/dispatches/pending").then((data) => {
+      const requestedId = sessionStorage.getItem("inventario.dispatchInvoiceId");
+      sessionStorage.removeItem("inventario.dispatchInvoiceId");
+      setPending(data);
+      setSelectedId(data.find((item) => item.id === requestedId)?.id ?? data[0]?.id ?? null);
+    })
       .catch((caught) => setError(caught instanceof Error ? caught.message : "No pudimos cargar los despachos pendientes."))
       .finally(() => setLoading(false));
   }, []);
@@ -51,10 +58,10 @@ export function DispatchCenter() {
     if (!selectedId) return;
     setSaving(true); setError(null); setSuccess(null);
     try {
-      const result = await apiRequest<{ invoice_number: string; dispatch_status: string }>("/dispatches", { method: "POST", body: JSON.stringify({ invoice_id: selectedId, responsible_name: responsible, recipient: recipient || null, notes: notes || null, lines: reports }) });
+      const result = await apiRequest<{ invoice_number: string; dispatch_status: string }>("/dispatches", { method: "POST", body: JSON.stringify({ invoice_id: selectedId, dispatched_at: dispatchDate ? new Date(dispatchDate).toISOString() : null, guide_number: guideNumber || null, responsible_name: responsible, recipient: recipient || null, notes: notes || null, lines: reports }) });
       const refreshed = await loadPending();
       setSuccess(`Despacho de ${result.invoice_number} registrado como ${result.dispatch_status === "complete" ? "completo" : "parcial"}.`);
-      setResponsible(""); setRecipient(""); setNotes(""); setTrace(null);
+      setResponsible(""); setDispatchDate(""); setGuideNumber(""); setRecipient(""); setNotes(""); setTrace(null);
       setSelectedId(refreshed.find((item) => item.id === selectedId)?.id ?? refreshed[0]?.id ?? null);
       if (refreshed.some((item) => item.id === selectedId)) {
         const updatedTrace = await apiRequest<Trace>(`/invoices/${selectedId}/traceability`); setTrace(updatedTrace); setReports(emptyReports(updatedTrace));
@@ -64,7 +71,7 @@ export function DispatchCenter() {
   };
 
   return <main className="dashboard dispatch-center">
-    <section className="welcome-block"><p className="eyebrow">Salida física controlada</p><h1>Despachos</h1><p>Confirma lo que realmente salió de bodega. Los faltantes quedan bloqueados y abren una incidencia para su resolución.</p></section>
+    <section className="welcome-block"><p className="eyebrow">Seguimiento operativo</p><h1>Despachos</h1><p>Registra la salida asociada a la factura. El inventario ya fue descontado al confirmar la factura y no se afecta nuevamente aquí.</p></section>
     {error && <div className="message error" role="alert">{error}</div>}{success && <div className="message success">{success}</div>}
     <section className="order-workspace dispatch-workspace">
       <aside className="order-list"><div className="list-title"><strong>Facturas pendientes</strong><span>{pending.length}</span></div>
@@ -75,7 +82,7 @@ export function DispatchCenter() {
       <div className="order-detail">{!selected && !loading && <div className="empty-detail"><strong>Todo está despachado</strong><span>Las facturas nuevas aparecerán aquí automáticamente.</span></div>}
         {selected && !trace && <div className="table-message">Preparando cantidades pendientes…</div>}
         {selected && trace && <><header className="detail-header"><div><p className="eyebrow">{trace.purchase_order ? `OC ${trace.purchase_order.number} · ${trace.purchase_order.chain}` : "Factura excepcional"}</p><h2>{trace.invoice.number}</h2><p>{trace.invoice.customer}</p></div><span className="status-pill low_stock">{selected.dispatch_status === "partial" ? "Parcial" : "Pendiente"}</span></header>
-          <div className="dispatch-fields"><label><span>Responsable del despacho *</span><input required minLength={2} value={responsible} onChange={(event) => setResponsible(event.target.value)} /></label><label><span>Destinatario o transportista</span><input value={recipient} onChange={(event) => setRecipient(event.target.value)} /></label></div>
+          <div className="dispatch-fields"><label><span>Fecha del despacho</span><input type="datetime-local" value={dispatchDate} onChange={(event) => setDispatchDate(event.target.value)} /></label><label><span>Número de guía</span><input value={guideNumber} onChange={(event) => setGuideNumber(event.target.value)} /></label><label><span>Responsable del despacho *</span><input required minLength={2} value={responsible} onChange={(event) => setResponsible(event.target.value)} /></label><label><span>Destinatario o transportista</span><input value={recipient} onChange={(event) => setRecipient(event.target.value)} /></label></div>
           <section className="trace-section"><h3>Reporte de salida</h3><div className="dispatch-lines">{reports.map((report, index) => { const source = trace.lines.find((line) => line.sku === report.sku)!; const exceeds = report.dispatched_quantity + report.missing_quantity > source.pending_dispatch; return <article className={report.missing_quantity > 0 || exceeds ? "has-difference" : ""} key={report.sku}><div className="dispatch-product"><strong>{report.sku}</strong><span>{source.product_name}</span><small>Pendiente: {source.pending_dispatch}</small></div><label><span>Despachado</span><input min={0} max={source.pending_dispatch} type="number" value={report.dispatched_quantity} onChange={(event) => update(index, { dispatched_quantity: Number(event.target.value) })} /></label><label><span>Faltante</span><input min={0} max={source.pending_dispatch} type="number" value={report.missing_quantity} onChange={(event) => update(index, { missing_quantity: Number(event.target.value) })} /></label>{report.missing_quantity > 0 && <label className="missing-reason"><span>Motivo del faltante *</span><input required value={report.missing_reason} onChange={(event) => update(index, { missing_reason: event.target.value })} /></label>}{exceeds && <small className="validation-note">La suma supera las {source.pending_dispatch} unidades pendientes.</small>}</article>; })}</div></section>
           <label className="notes-field"><span>Observaciones del despacho</span><textarea rows={3} value={notes} onChange={(event) => setNotes(event.target.value)} /></label>
           <div className="dispatch-confirm"><span>Se reportarán <strong>{reportTotal}</strong> unidades</span><button className="primary-button" type="button" disabled={saving || responsible.trim().length < 2 || reports.length === 0 || reports.some((report) => report.dispatched_quantity + report.missing_quantity <= 0 || report.dispatched_quantity + report.missing_quantity > trace.lines.find((line) => line.sku === report.sku)!.pending_dispatch || report.missing_quantity > 0 && report.missing_reason.trim().length === 0)} onClick={confirm}>{saving ? "Confirmando…" : "Confirmar salida de bodega"}</button></div>

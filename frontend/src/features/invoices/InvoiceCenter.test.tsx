@@ -70,20 +70,19 @@ describe("InvoiceCenter", () => {
   });
 
   it("audita sin modificar y exige vista previa antes de corregir", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
+    const fetchMock = vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input);
-      const data = url.includes("correction-preview")
-        ? { correctable: [{ id: "invoice-2", invoice_number: "001-001-000000002", status_label: "Sin descontar", units_to_discount: 12 }], blocked: [], will_change_inventory: true }
-        : url.includes("inventory-audit")
-          ? { summary: { reviewed: 1, correct: 0, missing: 1, partial: 0, duplicate: 0, over: 0, cancelled_correct: 0, cancelled_missing_reversal: 0, errors: 0 }, items: [{ id: "invoice-2", invoice_number: "001-001-000000002", invoice_date: "2026-07-28", invoiced_units: 12, discounted_units: 0, difference: 12, status: "missing", status_label: "Sin descontar" }] }
+      const data = url.includes("inventory-audit")
+          ? { summary: { reviewed: 0, correct: 0, missing: 0, partial: 0, excess_or_duplicate: 0, cancelled_incorrect: 0, requires_review: 0, pending_units: 0, excess_units: 0, orphan_movements: 0 }, items: [], orphan_movements: [], page: 1, pages: 1, total: 0, read_only: true }
           : { items: [], page: 1, pages: 1, total: 0, missing_sequences: [] };
       return new Response(JSON.stringify(data), { status: 200, headers: { "Content-Type": "application/json" } });
-    }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
     const { container } = render(<InvoiceCenter />);
-    fireEvent.click(within(container).getByRole("button", { name: "Revisar y descontar pendientes" }));
-    expect((await within(container).findAllByText(/001-001-000000002/))[0]).toBeVisible();
-    expect(await within(container).findByText(/descontar únicamente 12 unidades pendientes/)).toBeVisible();
-    expect(within(container).getByRole("button", { name: "Confirmar y descontar pendientes" })).toBeVisible();
+    fireEvent.click(within(container).getByRole("button", { name: "Abrir auditoría" }));
+    expect(await within(container).findByRole("heading", { name: "Auditoría de facturas e inventario" })).toBeVisible();
+    expect(within(container).getByText(/consultar, filtrar o abrir detalles no modifica/i)).toBeVisible();
+    expect(fetchMock.mock.calls.every((call) => !call[1]?.method || call[1].method === "GET")).toBe(true);
   });
 
   it("usa GET y convierte un 405 en un error recuperable", async () => {
