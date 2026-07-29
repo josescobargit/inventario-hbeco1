@@ -37,6 +37,13 @@ interface OrderLine {
   shortage: number;
   complete: boolean;
   billing_result?: string;
+  pending_invoice_quantity: number;
+  excess_invoice_quantity: number;
+  billing_comparison_result: string;
+  invoice_breakdown: Array<{
+    id: string; invoice_number: string; invoice_date: string; quantity: number;
+    administrative_status: string;
+  }>;
   original_quantity?: number | null;
   original_unit?: string | null;
   units_per_box?: number | null;
@@ -55,6 +62,7 @@ interface PurchaseOrder {
   source_documents: Array<ViewableDocument & { extraction_method: string; available?: boolean }>;
   related_invoices: Array<{
     id: string; invoice_number: string; administrative_status: string;
+    invoice_date: string; inventory_status: string; inventory_status_label: string;
     dispatch_status: string; delivery_status: string;
     dispatches: Array<{ id: string; dispatched_at: string }>;
     deliveries: Array<{ id: string; delivered_at: string }>;
@@ -63,6 +71,11 @@ interface PurchaseOrder {
   has_related_operations: boolean;
   manually_modified: boolean;
   product_count: number;
+  billing_summary: {
+    ordered_units: number; invoiced_units: number; pending_units: number; excess_units: number;
+    complete_products: number; partial_products: number; not_invoiced_products: number;
+    result: string;
+  };
 }
 interface PurchaseOrderPage { items: Array<Pick<PurchaseOrder, "id" | "chain_name" | "order_number" | "order_date" | "destination" | "status" | "product_count">>; next_cursor: string | null }
 
@@ -96,7 +109,10 @@ const fulfillmentLabels: Record<string, string> = {
 const summaryOrder = (order: PurchaseOrderPage["items"][number]): PurchaseOrder => ({
   ...order, customer_name: order.chain_name, notes: null, lines: [], source_documents: [],
   related_invoices: [], related_reservations: [], has_related_operations: false,
-  manually_modified: false,
+  manually_modified: false, billing_summary: {
+    ordered_units: 0, invoiced_units: 0, pending_units: 0, excess_units: 0,
+    complete_products: 0, partial_products: 0, not_invoiced_products: 0, result: "Se puede facturar",
+  },
 });
 
 function ProductSearch({ products, value, disabledSkus, onChange, onProductLoaded, label }: {
@@ -226,6 +242,16 @@ export function PurchaseOrderCenter() {
 
   const normalizeDetail = (order: PurchaseOrder): PurchaseOrder => ({
     ...order, product_count: order.lines.length,
+    billing_summary: order.billing_summary ?? {
+      ordered_units: order.lines.reduce((total, line) => total + line.ordered_quantity, 0),
+      invoiced_units: order.lines.reduce((total, line) => total + (line.invoiced_quantity ?? 0), 0),
+      pending_units: order.lines.reduce((total, line) => total + Math.max(line.ordered_quantity - (line.invoiced_quantity ?? 0), 0), 0),
+      excess_units: order.lines.reduce((total, line) => total + Math.max((line.invoiced_quantity ?? 0) - line.ordered_quantity, 0), 0),
+      complete_products: order.lines.filter((line) => line.ordered_quantity > 0 && line.invoiced_quantity === line.ordered_quantity).length,
+      partial_products: order.lines.filter((line) => (line.invoiced_quantity ?? 0) > 0 && (line.invoiced_quantity ?? 0) < line.ordered_quantity).length,
+      not_invoiced_products: order.lines.filter((line) => !(line.invoiced_quantity ?? 0)).length,
+      result: "Se puede facturar",
+    },
     source_documents: order.source_documents ?? [], related_invoices: order.related_invoices ?? [],
     related_reservations: order.related_reservations ?? [],
     has_related_operations: order.has_related_operations ?? Boolean(order.related_invoices?.length),
@@ -237,6 +263,10 @@ export function PurchaseOrderCenter() {
       pending_delivery: line.pending_delivery ?? line.ordered_quantity,
       difference: line.difference ?? -line.ordered_quantity,
       fulfillment_status: line.fulfillment_status ?? "not_processed", has_incident: line.has_incident ?? false,
+      pending_invoice_quantity: line.pending_invoice_quantity ?? Math.max(line.ordered_quantity - (line.invoiced_quantity ?? 0), 0),
+      excess_invoice_quantity: line.excess_invoice_quantity ?? Math.max((line.invoiced_quantity ?? 0) - line.ordered_quantity, 0),
+      billing_comparison_result: line.billing_comparison_result ?? (!(line.invoiced_quantity ?? 0) ? "No facturado" : (line.invoiced_quantity ?? 0) < line.ordered_quantity ? "Facturación parcial" : (line.invoiced_quantity ?? 0) === line.ordered_quantity ? "Facturado completo" : "Facturado en exceso"),
+      invoice_breakdown: line.invoice_breakdown ?? [],
     })),
   });
   const loadOrderPage = async (append = false, cursor: string | null = null) => {
@@ -695,6 +725,12 @@ export function PurchaseOrderCenter() {
             {selected.manually_modified && <div className="message warning">Esta OC contiene modificaciones manuales posteriores al documento original.</div>}
             <div className="mobile-detail-tabs" role="group" aria-label="Vista de la orden"><button type="button" className={detailPane === "document" ? "active" : ""} onClick={() => setDetailPane("document")}>Documento original</button><button type="button" className={detailPane === "data" ? "active" : ""} onClick={() => setDetailPane("data")}>Datos reconocidos</button><button type="button" className={detailPane === "comparison" ? "active" : ""} onClick={() => setDetailPane("comparison")}>Comparación</button></div>
             <section className={`trace-section detail-data-pane mobile-pane-${detailPane}`}><div className="line-heading"><h3>Disponibilidad y facturación</h3><div className="billing-filters" role="group" aria-label="Filtrar disponibilidad">{([["all", "Todos"], ["billable", "Facturables"], ["shortage", "Con faltantes"], ["no_stock", "Sin inventario"], ["review", "Pendientes de revisión"]] as const).map(([value, label]) => <button type="button" className={billingFilter === value ? "active" : ""} key={value} onClick={() => setBillingFilter(value)}>{label}</button>)}</div></div><div className="table-scroll"><table><thead><tr><th>Producto</th><th>Pedido</th><th>Ya facturado</th><th>Pendiente</th><th>Disponible</th><th>Sugerido a facturar</th><th>Faltante</th><th>Resultado</th></tr></thead><tbody>{billingLines.map((line) => <tr key={line.sku} className={line.complete ? "" : "row-warning"}><td><ProductIdentity name={line.product_name} sku={line.sku} /></td><td>{line.ordered_quantity}</td><td>{line.invoiced_quantity}</td><td>{Math.max(line.ordered_quantity - line.invoiced_quantity, 0)}</td><td>{line.available}</td><td><strong>{line.suggested_to_invoice}</strong></td><td>{line.shortage}</td><td><span className={`status-pill ${line.complete ? "available" : "low_stock"}`}>{line.billing_result ?? (line.complete ? "Lista para facturar completa" : "Con faltante")}</span></td></tr>)}</tbody></table>{billingLines.length === 0 && <div className="table-message">No hay productos en este filtro.</div>}</div></section>
+            <section className="trace-section po-billing-comparison">
+              <div className="line-heading"><div><h3>Pedido vs. facturado</h3><p>Todas las cantidades se comparan en unidades. Las facturas anuladas están excluidas.</p></div><span className={`status-pill ${selected.billing_summary.excess_units ? "low_stock" : "available"}`}>{selected.billing_summary.result}</span></div>
+              <div className="fulfillment-summary"><div><span>Unidades pedidas</span><strong>{selected.billing_summary.ordered_units}</strong></div><div><span>Unidades facturadas</span><strong>{selected.billing_summary.invoiced_units}</strong></div><div><span>Unidades pendientes</span><strong>{selected.billing_summary.pending_units}</strong></div><div><span>Unidades en exceso</span><strong>{selected.billing_summary.excess_units}</strong></div><div><span>Productos completos</span><strong>{selected.billing_summary.complete_products}</strong></div><div><span>Productos parciales</span><strong>{selected.billing_summary.partial_products}</strong></div><div><span>Productos sin facturar</span><strong>{selected.billing_summary.not_invoiced_products}</strong></div></div>
+              <div className="table-scroll"><table><thead><tr><th>Producto</th><th>Pedido</th><th>Facturado acumulado</th><th>Pendiente</th><th>Exceso</th><th>Resultado</th><th>Facturas</th></tr></thead><tbody>{selected.lines.map((line) => <tr key={`billing-${line.sku}`} className={line.excess_invoice_quantity > 0 || line.ordered_quantity === 0 ? "row-warning" : ""}><td><ProductIdentity name={line.product_name} sku={line.sku} /></td><td>{line.original_unit === "boxes" && line.original_quantity && line.units_per_box ? <span>{line.original_quantity} cajas × {line.units_per_box} = <strong>{line.ordered_quantity} unidades</strong></span> : `${line.ordered_quantity} unidades`}</td><td>{line.invoiced_quantity}</td><td>{line.pending_invoice_quantity}</td><td>{line.excess_invoice_quantity}</td><td><span className={`status-pill ${line.excess_invoice_quantity || line.ordered_quantity === 0 ? "low_stock" : "available"}`}>{line.billing_comparison_result}</span></td><td>{line.invoice_breakdown.length ? <details className="invoice-breakdown"><summary>{line.invoice_breakdown.length} factura{line.invoice_breakdown.length === 1 ? "" : "s"}</summary><div>{line.invoice_breakdown.map((invoice) => <button key={invoice.id} type="button" onClick={() => { sessionStorage.setItem("inventario.openInvoiceId", invoice.id); window.dispatchEvent(new CustomEvent("inventario:navigate", { detail: "invoices" })); }}><strong>{invoice.invoice_number}</strong><span>{invoice.invoice_date} · {invoice.quantity} unidades · {invoice.administrative_status}</span></button>)}</div></details> : "—"}</td></tr>)}</tbody></table></div>
+              <details className="related-invoices-disclosure"><summary>Ver facturas vinculadas</summary><div>{selected.related_invoices.length ? selected.related_invoices.map((invoice) => <button key={invoice.id} type="button" onClick={() => { sessionStorage.setItem("inventario.openInvoiceId", invoice.id); window.dispatchEvent(new CustomEvent("inventario:navigate", { detail: "invoices" })); }}><strong>{invoice.invoice_number}</strong><span>{invoice.invoice_date} · {invoice.administrative_status} · {invoice.inventory_status_label}</span></button>) : <p>No hay facturas vinculadas.</p>}</div></details>
+            </section>
             <section className="po-document-comparison">
               <aside className={`po-original-panel mobile-pane-${detailPane}`}><h3>Documento de origen</h3>{selected.source_documents.length > 1 && <div className="document-selector">{selected.source_documents.map((document) => <button type="button" className={selectedDocument?.token === document.token ? "active" : ""} key={document.token} onClick={() => setSelectedDocumentToken(document.token)}>{document.filename}</button>)}</div>}{selectedDocument?.available ? <DocumentViewer document={selectedDocument} url={apiUrl(`/purchase-orders/imports/${selectedDocument.token}/content`)} /> : selectedDocument ? <div className="table-message">Por privacidad y rendimiento, el archivo se eliminó después de extraer y confirmar la información. Se conserva únicamente su nombre y huella de auditoría.</div> : <div className="table-message">Esta OC no fue creada desde un documento.</div>}<label className="secondary-button corrected-document-button">{attachingDocument ? "Procesando…" : "Procesar documento corregido"}<input hidden disabled={attachingDocument} type="file" accept=".pdf,.jpg,.jpeg,.png,.webp" onChange={(event) => attachCorrectedDocument(selected, event.target.files?.[0])} /></label></aside>
               <div className={`po-comparison-panel mobile-pane-${detailPane}`}><div className="line-heading"><div><h3>Comparación: pedido vs. cumplimiento</h3><p>Las entregas se muestran en bruto; las devoluciones permanecen separadas según la regla actual.</p></div><label className="difference-filter"><input type="checkbox" checked={differenceOnly} onChange={(event) => setDifferenceOnly(event.target.checked)} /> Solo con diferencias</label></div>

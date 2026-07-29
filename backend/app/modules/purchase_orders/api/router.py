@@ -4,6 +4,7 @@ import os
 import shutil
 import tempfile
 import uuid
+from collections import defaultdict
 from hashlib import sha256
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -32,6 +33,7 @@ from app.modules.invoices.infrastructure.models import (
     InvoiceAlert,
     InvoiceLine,
 )
+from app.modules.invoices.domain.inventory_audit import audit_invoices
 from app.modules.purchase_orders.infrastructure.models import (
     CustomerProductAlias,
     PurchaseOrder,
@@ -237,17 +239,44 @@ def detail(db: Session, order: PurchaseOrder) -> dict:
         )
         .order_by(PurchaseOrderLine.sort_order, Product.sku)
     ).all()
+    active_invoice_rows = db.execute(
+        select(Invoice, InvoiceLine, Product)
+        .join(InvoiceLine, InvoiceLine.invoice_id == Invoice.id)
+        .join(Product, Product.id == InvoiceLine.product_id)
+        .where(
+            Invoice.purchase_order_id == order.id,
+            Invoice.administrative_status == "confirmed",
+        )
+        .order_by(
+            Invoice.establishment_number,
+            Invoice.emission_point,
+            Invoice.sequential_number,
+            InvoiceLine.id,
+        )
+    ).all()
+    invoiced_by_product: dict[uuid.UUID, int] = defaultdict(int)
+    invoice_breakdown_by_product: dict[uuid.UUID, dict[uuid.UUID, dict]] = defaultdict(
+        dict
+    )
+    invoiced_products: dict[uuid.UUID, Product] = {}
+    for invoice, invoice_line, product in active_invoice_rows:
+        invoiced_by_product[product.id] += invoice_line.quantity
+        invoiced_products[product.id] = product
+        breakdown = invoice_breakdown_by_product[product.id].setdefault(
+            invoice.id,
+            {
+                "id": invoice.id,
+                "invoice_number": invoice.invoice_number,
+                "invoice_date": invoice.invoice_date,
+                "quantity": 0,
+                "administrative_status": invoice.administrative_status,
+            },
+        )
+        breakdown["quantity"] += invoice_line.quantity
+    ordered_product_ids = {product.id for _, product, _ in rows}
     lines = []
     for line, product, stored in rows:
-        invoiced = db.scalar(
-            select(func.coalesce(func.sum(InvoiceLine.quantity), 0))
-            .join(Invoice, Invoice.id == InvoiceLine.invoice_id)
-            .where(
-                Invoice.purchase_order_id == order.id,
-                Invoice.administrative_status == "confirmed",
-                InvoiceLine.product_id == product.id,
-            )
-        )
+        invoiced = invoiced_by_product.get(product.id, 0)
         dispatched = db.scalar(
             select(func.coalesce(func.sum(DispatchLine.dispatched_quantity), 0))
             .select_from(DispatchLine)
@@ -309,6 +338,7 @@ def detail(db: Session, order: PurchaseOrder) -> dict:
             stored.blocked_by_incident,
         )
         pending = max(0, line.ordered_quantity - invoiced)
+        excess = max(0, invoiced - line.ordered_quantity)
         suggested = max(0, min(pending, position.available_to_invoice))
         shortage = max(0, pending - position.available_to_invoice)
         lines.append(
@@ -334,6 +364,20 @@ def detail(db: Session, order: PurchaseOrder) -> dict:
                 ),
                 "has_incident": has_incident,
                 "remaining_quantity": pending,
+                "pending_invoice_quantity": pending,
+                "excess_invoice_quantity": excess,
+                "billing_comparison_result": (
+                    "Facturado en exceso"
+                    if excess
+                    else "Facturado completo"
+                    if invoiced == line.ordered_quantity and invoiced > 0
+                    else "Facturación parcial"
+                    if invoiced > 0
+                    else "No facturado"
+                ),
+                "invoice_breakdown": list(
+                    invoice_breakdown_by_product.get(product.id, {}).values()
+                ),
                 "available": position.available_to_invoice,
                 "suggested_to_invoice": suggested,
                 "shortage": shortage,
@@ -356,6 +400,76 @@ def detail(db: Session, order: PurchaseOrder) -> dict:
                 "source_text": line.source_text,
                 "source_code": line.source_code,
                 "source_description": line.source_description,
+            }
+        )
+    extra_product_ids = set(invoiced_by_product) - ordered_product_ids
+    extra_positions = {
+        product_id: stored
+        for product_id, stored in db.execute(
+            select(
+                InventoryPositionModel.product_id,
+                InventoryPositionModel,
+            )
+            .join(Warehouse, Warehouse.id == InventoryPositionModel.warehouse_id)
+            .where(
+                InventoryPositionModel.product_id.in_(extra_product_ids),
+                Warehouse.code == "principal",
+            )
+        ).all()
+    }
+    for product_id in sorted(
+        extra_product_ids,
+        key=lambda value: invoiced_products[value].sku,
+    ):
+        product = invoiced_products[product_id]
+        invoiced = invoiced_by_product[product_id]
+        stored = extra_positions.get(product_id)
+        position = (
+            InventoryPosition(
+                stored.physical_confirmed,
+                stored.reserved,
+                stored.invoiced_not_dispatched,
+                stored.blocked_by_incident,
+            )
+            if stored
+            else InventoryPosition(0, 0, 0, 0)
+        )
+        lines.append(
+            {
+                "sku": product.sku,
+                "product_name": product.name,
+                "sort_order": len(lines),
+                "ordered_quantity": 0,
+                "invoiced_quantity": invoiced,
+                "dispatched_quantity": 0,
+                "delivered_quantity": 0,
+                "returned_quantity": 0,
+                "net_delivered_quantity": 0,
+                "pending_delivery": 0,
+                "difference": 0,
+                "fulfillment_status": "with_incident",
+                "has_incident": True,
+                "remaining_quantity": 0,
+                "pending_invoice_quantity": 0,
+                "excess_invoice_quantity": invoiced,
+                "billing_comparison_result": "Producto facturado no incluido en la OC",
+                "invoice_breakdown": list(
+                    invoice_breakdown_by_product[product_id].values()
+                ),
+                "available": position.available_to_invoice,
+                "suggested_to_invoice": 0,
+                "shortage": 0,
+                "complete": False,
+                "billing_result": "Requiere revisión",
+                "original_quantity": None,
+                "original_unit": "units",
+                "units_per_box": None,
+                "conversion_method": None,
+                "conversion_confirmed": True,
+                "source_page": None,
+                "source_text": None,
+                "source_code": None,
+                "source_description": None,
             }
         )
     source_documents = [
@@ -381,11 +495,30 @@ def detail(db: Session, order: PurchaseOrder) -> dict:
             .order_by(PurchaseOrderSourceDocument.created_at)
         )
     ]
+    related_invoice_models = list(
+        db.scalars(
+            select(Invoice)
+            .where(Invoice.purchase_order_id == order.id)
+            .order_by(
+                Invoice.establishment_number,
+                Invoice.emission_point,
+                Invoice.sequential_number,
+            )
+        )
+    )
+    invoice_inventory = {
+        item["id"]: item for item in audit_invoices(
+            db, [invoice.id for invoice in related_invoice_models]
+        )
+    }
     related_invoices = [
         {
             "id": invoice.id,
             "invoice_number": invoice.invoice_number,
+            "invoice_date": invoice.invoice_date,
             "administrative_status": invoice.administrative_status,
+            "inventory_status": invoice_inventory[invoice.id]["status"],
+            "inventory_status_label": invoice_inventory[invoice.id]["status_label"],
             "dispatch_status": invoice.dispatch_status,
             "delivery_status": invoice.delivery_status,
             "dispatches": [
@@ -405,11 +538,7 @@ def detail(db: Session, order: PurchaseOrder) -> dict:
                 )
             ],
         }
-        for invoice in db.scalars(
-            select(Invoice)
-            .where(Invoice.purchase_order_id == order.id)
-            .order_by(Invoice.invoice_date, Invoice.invoice_number)
-        )
+        for invoice in related_invoice_models
     ]
     related_reservations = [
         {
@@ -447,6 +576,40 @@ def detail(db: Session, order: PurchaseOrder) -> dict:
         "secondary_reference": order.secondary_reference,
         "local_name": order.local_name,
         "lines": lines,
+        "billing_summary": {
+            "ordered_units": sum(item["ordered_quantity"] for item in lines),
+            "invoiced_units": sum(item["invoiced_quantity"] for item in lines),
+            "pending_units": sum(item["pending_invoice_quantity"] for item in lines),
+            "excess_units": sum(item["excess_invoice_quantity"] for item in lines),
+            "complete_products": sum(
+                item["billing_comparison_result"] == "Facturado completo"
+                for item in lines
+            ),
+            "partial_products": sum(
+                item["billing_comparison_result"] == "Facturación parcial"
+                for item in lines
+            ),
+            "not_invoiced_products": sum(
+                item["billing_comparison_result"] == "No facturado"
+                for item in lines
+            ),
+            "result": (
+                "Tiene diferencias que requieren revisión"
+                if any(
+                    item["excess_invoice_quantity"] > 0
+                    or item["billing_comparison_result"]
+                    == "Producto facturado no incluido en la OC"
+                    for item in lines
+                )
+                else "Ya está completamente facturada"
+                if lines and all(
+                    item["pending_invoice_quantity"] == 0 for item in lines
+                )
+                else "Se puede facturar parcialmente"
+                if any(item["invoiced_quantity"] > 0 for item in lines)
+                else "Se puede facturar"
+            ),
+        },
         "source_documents": source_documents,
         "related_invoices": related_invoices,
         "related_reservations": related_reservations,

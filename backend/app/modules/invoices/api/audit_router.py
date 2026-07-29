@@ -5,7 +5,7 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -32,12 +32,34 @@ router = APIRouter(prefix="/invoices", tags=["Auditoría de facturas"])
 
 class CorrectionInput(BaseModel):
     confirmation: Literal["CORREGIR"]
-    invoice_ids: list[uuid.UUID] = Field(default_factory=list, max_length=200)
+    invoice_ids: list[uuid.UUID] = Field(min_length=1, max_length=200)
     reason: str = Field(min_length=5, max_length=500)
+
+
+PENDING_STATUS_LABELS = {
+    "pending_complete": "Pendiente completa",
+    "pending_partial": "Pendiente parcial",
+    "error": "Error al descontar",
+    "processing": "En procesamiento",
+}
 
 
 def _public_audit(item: dict) -> dict:
     return {key: value for key, value in item.items() if key != "product_differences"}
+
+
+def _pending_status(invoice: Invoice, audit: dict) -> str:
+    if invoice.inventory_status == "processing":
+        return "processing"
+    if (
+        invoice.inventory_status == "error"
+        or invoice.inventory_last_error
+        or audit["status"] in {"error", "duplicate", "over"}
+    ):
+        return "error"
+    if audit["status"] == "missing":
+        return "pending_complete"
+    return "pending_partial"
 
 
 @router.get("/inventory-audit")
@@ -46,9 +68,218 @@ def invoice_inventory_audit(
     db: Annotated[Session, Depends(get_db)],
 ) -> dict:
     items = audit_invoices(db)
+    product_ids = {
+        difference["product_id"]
+        for item in items
+        for difference in item["product_differences"]
+    }
+    products = {
+        product.id: product
+        for product in db.scalars(
+            select(Product).where(Product.id.in_(product_ids))
+        ).all()
+    }
     return {
         "summary": audit_summary(items),
-        "items": [_public_audit(item) for item in items],
+        "items": [
+            {
+                **_public_audit(item),
+                "products": [
+                    {
+                        **difference,
+                        "product_name": (
+                            products[difference["product_id"]].name
+                            if difference["product_id"] in products
+                            else "Producto no disponible"
+                        ),
+                        "sku": (
+                            products[difference["product_id"]].sku
+                            if difference["product_id"] in products
+                            else "—"
+                        ),
+                        "pending_units": max(0, difference["difference"]),
+                    }
+                    for difference in item["product_differences"]
+                ],
+            }
+            for item in items
+        ],
+        "read_only": True,
+        "generated_at": datetime.now(timezone.utc),
+    }
+
+
+@router.get("/inventory-pending")
+def pending_inventory_invoices(
+    _user: CurrentUser,
+    db: Annotated[Session, Depends(get_db)],
+    search: Annotated[str | None, Query(max_length=100)] = None,
+    sequence: Annotated[str | None, Query(max_length=30)] = None,
+    purchase_order: Annotated[str | None, Query(max_length=100)] = None,
+    chain: Annotated[str | None, Query(max_length=160)] = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    status: Literal[
+        "pending_complete",
+        "pending_partial",
+        "error",
+        "processing",
+    ]
+    | None = None,
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=10, le=100)] = 25,
+) -> dict:
+    candidate_statement = (
+        select(Invoice.id)
+        .outerjoin(PurchaseOrder, PurchaseOrder.id == Invoice.purchase_order_id)
+        .where(Invoice.administrative_status != "cancelled")
+        .order_by(
+            Invoice.establishment_number,
+            Invoice.emission_point,
+            Invoice.sequential_number,
+            Invoice.id,
+        )
+    )
+    if search and search.strip():
+        candidate_statement = candidate_statement.where(
+            Invoice.invoice_number.ilike(f"%{search.strip()}%")
+        )
+    if sequence and sequence.strip():
+        candidate_statement = candidate_statement.where(
+            Invoice.invoice_number.ilike(f"%{sequence.strip()}%")
+        )
+    if purchase_order and purchase_order.strip():
+        candidate_statement = candidate_statement.where(
+            PurchaseOrder.order_number.ilike(f"%{purchase_order.strip()}%")
+        )
+    if chain and chain.strip():
+        candidate_statement = candidate_statement.where(
+            Invoice.chain_name.ilike(f"%{chain.strip()}%")
+        )
+    if date_from:
+        candidate_statement = candidate_statement.where(
+            Invoice.invoice_date >= date_from
+        )
+    if date_to:
+        candidate_statement = candidate_statement.where(Invoice.invoice_date <= date_to)
+    candidate_ids = list(db.scalars(candidate_statement).all())
+    audited = audit_invoices(db, candidate_ids) if candidate_ids else []
+    pending_audits = [
+        item
+        for item in audited
+        if item["administrative_status"] != "cancelled"
+        and any(
+            difference["difference"] > 0 for difference in item["product_differences"]
+        )
+    ]
+    metadata_rows = (
+        db.execute(
+            select(Invoice, PurchaseOrder.order_number)
+            .outerjoin(PurchaseOrder, PurchaseOrder.id == Invoice.purchase_order_id)
+            .where(Invoice.id.in_([item["id"] for item in pending_audits]))
+        ).all()
+        if pending_audits
+        else []
+    )
+    metadata = {
+        invoice.id: (invoice, order_number) for invoice, order_number in metadata_rows
+    }
+    product_ids = {
+        difference["product_id"]
+        for item in pending_audits
+        for difference in item["product_differences"]
+        if difference["expected"] > 0
+    }
+    products = {
+        product.id: product
+        for product in db.scalars(
+            select(Product).where(Product.id.in_(product_ids))
+        ).all()
+    }
+    items = []
+    for audit in pending_audits:
+        invoice, order_number = metadata[audit["id"]]
+        pending_status = _pending_status(invoice, audit)
+        if status and pending_status != status:
+            continue
+        lines = []
+        for difference in audit["product_differences"]:
+            if difference["expected"] <= 0:
+                continue
+            product = products.get(difference["product_id"])
+            discounted = max(
+                0,
+                min(difference["expected"], difference["discounted"]),
+            )
+            lines.append(
+                {
+                    "product_id": difference["product_id"],
+                    "product_name": product.name
+                    if product
+                    else "Producto no disponible",
+                    "sku": product.sku if product else "—",
+                    "invoiced_units": difference["expected"],
+                    "discounted_units": discounted,
+                    "pending_units": difference["expected"] - discounted,
+                }
+            )
+        pending_units = sum(line["pending_units"] for line in lines)
+        invoiced_units = sum(line["invoiced_units"] for line in lines)
+        items.append(
+            {
+                "id": invoice.id,
+                "invoice_number": invoice.invoice_number,
+                "invoice_date": invoice.invoice_date,
+                "chain_name": invoice.chain_name or invoice.customer_name,
+                "purchase_order_id": invoice.purchase_order_id,
+                "purchase_order_number": order_number,
+                "invoiced_units": invoiced_units,
+                "discounted_units": invoiced_units - pending_units,
+                "pending_units": pending_units,
+                "status": pending_status,
+                "status_label": PENDING_STATUS_LABELS[pending_status],
+                "error": invoice.inventory_last_error,
+                "attempts": invoice.inventory_attempts,
+                "lines": lines,
+            }
+        )
+    total = len(items)
+    start = (page - 1) * page_size
+    duplicate_findings = [
+        _public_audit(item)
+        for item in audited
+        if item["status"] in {"duplicate", "over"}
+    ]
+    error_findings = [item for item in items if item["status"] == "error"]
+    return {
+        "summary": {
+            "pending_invoices": total,
+            "pending_complete": sum(
+                item["status"] == "pending_complete" for item in items
+            ),
+            "pending_partial": sum(
+                item["status"] == "pending_partial" for item in items
+            ),
+            "errors": sum(item["status"] == "error" for item in items),
+            "processing": sum(item["status"] == "processing" for item in items),
+            "pending_units": sum(item["pending_units"] for item in items),
+        },
+        "items": items[start : start + page_size],
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "pages": max(1, (total + page_size - 1) // page_size),
+        "findings": {
+            "possible_duplicates": duplicate_findings,
+            "errors": [
+                {
+                    "id": item["id"],
+                    "invoice_number": item["invoice_number"],
+                    "error": item["error"],
+                }
+                for item in error_findings
+            ],
+        },
         "read_only": True,
         "generated_at": datetime.now(timezone.utc),
     }
@@ -111,6 +342,7 @@ def correct_pending_movements(
         if (
             fresh["status"] not in {"missing", "partial"}
             or invoice.administrative_status == "cancelled"
+            or invoice.inventory_status == "processing"
         ):
             invoice.inventory_status = stored_inventory_status(fresh["status"])
             invoice.inventory_last_error = (
@@ -279,10 +511,31 @@ def correct_pending_movements(
                     "detail": "La corrección ya había sido aplicada.",
                 }
             )
+        except SQLAlchemyError as caught:
+            invoice_id = candidate["id"]
+            invoice_number = candidate["invoice_number"]
+            db.rollback()
+            detail = str(caught)[:1000]
+            failed_invoice = db.get(Invoice, invoice_id)
+            if failed_invoice is not None:
+                failed_invoice.inventory_status = "error"
+                failed_invoice.inventory_last_error = detail
+                failed_invoice.inventory_attempts += 1
+                db.commit()
+            results.append(
+                {
+                    "id": invoice_id,
+                    "invoice_number": invoice_number,
+                    "status": "error",
+                    "detail": detail,
+                }
+            )
     return {
         "results": results,
+        "processed": len(results),
         "corrected": sum(item["status"] == "corrected" for item in results),
         "errors": sum(item["status"] == "error" for item in results),
+        "skipped": sum(item["status"] == "skipped" for item in results),
         "inventory_affected": inventory_affected,
     }
 
@@ -298,7 +551,7 @@ def invoice_listing(
     date_to: date | None = None,
     status: Annotated[str | None, Query(max_length=30)] = None,
     inventory_status: Annotated[str | None, Query(max_length=40)] = None,
-    sort: Literal["sequence", "recent", "oldest"] = "sequence",
+    sort: Literal["sequence", "sequence_desc", "recent"] = "sequence",
     page: Annotated[int, Query(ge=1)] = 1,
     page_size: Annotated[int, Query(ge=10, le=100)] = 25,
 ) -> dict:
@@ -349,8 +602,13 @@ def invoice_listing(
             Invoice.sequential_number,
             Invoice.id,
         ),
+        "sequence_desc": (
+            Invoice.establishment_number.desc(),
+            Invoice.emission_point.desc(),
+            Invoice.sequential_number.desc(),
+            Invoice.id.desc(),
+        ),
         "recent": (Invoice.invoice_date.desc(), Invoice.created_at.desc()),
-        "oldest": (Invoice.invoice_date, Invoice.created_at),
     }[sort]
     if inventory_status:
         rows = list(db.execute(statement.order_by(*ordering)).all())
@@ -374,8 +632,14 @@ def invoice_listing(
     enriched = []
     for invoice, order_number, product_count, units in rows:
         audit = audited[invoice.id]
-        if inventory_status and audit["status"] != inventory_status:
-            continue
+        if inventory_status:
+            accepted_statuses = (
+                {"error", "duplicate", "over", "cancelled_missing_reversal"}
+                if inventory_status == "error"
+                else {inventory_status}
+            )
+            if audit["status"] not in accepted_statuses:
+                continue
         enriched.append(
             {
                 "id": invoice.id,
@@ -421,6 +685,16 @@ def invoice_listing(
         page_items = enriched[start : start + page_size]
     else:
         page_items = enriched
+    complete_audit = (
+        list(audited.values())
+        if not inventory_status and page == 1 and total <= page_size
+        else audit_invoices(db)
+    )
+    active_audit = [
+        item
+        for item in complete_audit
+        if item["administrative_status"] != "cancelled"
+    ]
     return {
         "items": page_items,
         "page": page,
@@ -428,4 +702,23 @@ def invoice_listing(
         "total": total,
         "pages": max(1, (total + page_size - 1) // page_size),
         "missing_sequences": missing[:200],
+        "summary": {
+            "invoices": len(complete_audit),
+            "missing": sum(item["status"] == "missing" for item in active_audit),
+            "partial": sum(item["status"] == "partial" for item in active_audit),
+            "errors": sum(
+                item["status"] in {"error", "duplicate", "over"}
+                for item in active_audit
+            ),
+            "discounted": sum(item["status"] == "correct" for item in active_audit),
+            "cancelled": sum(
+                item["administrative_status"] == "cancelled"
+                for item in complete_audit
+            ),
+            "pending_units": sum(
+                max(0, difference["difference"])
+                for item in active_audit
+                for difference in item["product_differences"]
+            ),
+        },
     }

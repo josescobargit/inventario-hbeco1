@@ -1,10 +1,12 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { InvoiceCenter } from "./InvoiceCenter";
 
+afterEach(() => cleanup());
+
 describe("InvoiceCenter", () => {
-  it("explica su alcance y muestra un estado vacío útil", async () => {
+  it("muestra únicamente la lista y un estado vacío útil", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue(
@@ -17,9 +19,9 @@ describe("InvoiceCenter", () => {
 
     render(<InvoiceCenter />);
 
-    expect(screen.getByText(/aquí no se factura/i)).toBeVisible();
-    expect(await screen.findByText("No encontramos facturas.")).toBeVisible();
-    expect(screen.getByText("Selecciona una factura")).toBeVisible();
+    expect(screen.getByText(/listado secuencial de facturas/i)).toBeVisible();
+    expect(await screen.findByText("No se encontraron facturas con estos filtros.")).toBeVisible();
+    expect(screen.queryByLabelText("Detalle de factura")).not.toBeInTheDocument();
   });
 
   it("muestra la factura como entrega pendiente y calcula la comparación", async () => {
@@ -57,6 +59,7 @@ describe("InvoiceCenter", () => {
 
     render(<InvoiceCenter />);
 
+    fireEvent.click(await screen.findByText(summary.invoice_number));
     expect(await screen.findByText("Facturada · Entrega pendiente")).toBeVisible();
     const table = screen.getByRole("heading", { name: "Factura → entrega" }).nextElementSibling;
     expect(table).toHaveTextContent("Producto");
@@ -77,10 +80,43 @@ describe("InvoiceCenter", () => {
       return new Response(JSON.stringify(data), { status: 200, headers: { "Content-Type": "application/json" } });
     }));
     const { container } = render(<InvoiceCenter />);
-    fireEvent.click(within(container).getByRole("button", { name: "Auditar facturas" }));
-    expect(await within(container).findByText(/001-001-000000002/)).toBeVisible();
-    fireEvent.click(within(container).getByRole("button", { name: "Corregir movimientos pendientes" }));
-    expect(await within(container).findByText(/salida pendiente de 12 unidades/)).toBeVisible();
-    expect(within(container).getByRole("button", { name: "Confirmar y corregir diferencias" })).toBeVisible();
+    fireEvent.click(within(container).getByRole("button", { name: "Revisar y descontar pendientes" }));
+    expect((await within(container).findAllByText(/001-001-000000002/))[0]).toBeVisible();
+    expect(await within(container).findByText(/descontar únicamente 12 unidades pendientes/)).toBeVisible();
+    expect(within(container).getByRole("button", { name: "Confirmar y descontar pendientes" })).toBeVisible();
+  });
+
+  it("usa GET y convierte un 405 en un error recuperable", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ detail: "Method Not Allowed" }), {
+      status: 405,
+      headers: { "Content-Type": "application/json", Allow: "PUT" },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<InvoiceCenter />);
+
+    expect(await screen.findByText("No se pudieron cargar las facturas.")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Reintentar" })).toBeVisible();
+    expect(screen.queryByText("Method Not Allowed")).not.toBeInTheDocument();
+    expect(fetchMock.mock.calls[0]?.[1]?.method).toBeUndefined();
+  });
+
+  it("cambia entre todas, sin descontar, parciales, errores, descontadas y anuladas", async () => {
+    const fetchMock = vi.fn().mockImplementation(async () => {
+      const data = { items: [], page: 1, pages: 1, total: 0, missing_sequences: [], summary: { invoices: 0, missing: 0, partial: 0, errors: 0, discounted: 0, cancelled: 0, pending_units: 0 } };
+      return new Response(JSON.stringify(data), { status: 200, headers: { "Content-Type": "application/json" } });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<InvoiceCenter />);
+    expect(await screen.findByText("No se encontraron facturas con estos filtros.")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: /Sin descontar/ }));
+    await waitFor(() => expect(fetchMock.mock.calls.some((call) => String(call[0]).includes("inventory_status=missing"))).toBe(true));
+    fireEvent.click(screen.getByRole("button", { name: /Parciales/ }));
+    await waitFor(() => expect(fetchMock.mock.calls.some((call) => String(call[0]).includes("inventory_status=partial"))).toBe(true));
+    fireEvent.click(screen.getByRole("button", { name: /Descontadas/ }));
+    await waitFor(() => expect(fetchMock.mock.calls.some((call) => String(call[0]).includes("inventory_status=correct"))).toBe(true));
+    expect(screen.getByRole("button", { name: /Con error/ })).toBeVisible();
+    expect(screen.getByRole("button", { name: /Anuladas/ })).toBeVisible();
   });
 });

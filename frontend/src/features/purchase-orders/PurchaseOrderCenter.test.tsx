@@ -44,6 +44,8 @@ describe("PurchaseOrderCenter", () => {
 
     fireEvent.click(listItem);
     expect(await screen.findByRole("heading", { name: "OC OC-10" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Pedido vs. facturado" })).toBeVisible();
+    expect(screen.getByText("12 unidades")).toBeVisible();
     expect(fetchMock.mock.calls.filter((call) => String(call[0]).endsWith("/purchase-orders/o1"))).toHaveLength(1);
   });
 

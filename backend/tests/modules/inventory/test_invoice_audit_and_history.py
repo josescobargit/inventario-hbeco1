@@ -22,6 +22,7 @@ from app.modules.invoices.api.audit_router import (
     correct_pending_movements,
     correction_preview,
     invoice_listing,
+    pending_inventory_invoices,
 )
 from app.modules.invoices.api.router import (
     InvoiceInput,
@@ -228,6 +229,83 @@ def test_partial_correction_applies_only_delta_and_audit_preview_is_read_only() 
     db.close()
 
 
+def test_pending_inventory_view_classifies_and_details_only_positive_differences() -> (
+    None
+):
+    _engine, db, user, _warehouse, _product, position = database()
+    register_invoice(payload(20), user, db, "pending-correct")
+    missing = register_invoice(payload(21), user, db, "pending-missing")
+    partial = register_invoice(payload(22), user, db, "pending-partial")
+    failed = register_invoice(payload(23), user, db, "pending-error")
+    processing = register_invoice(payload(24), user, db, "pending-processing")
+    cancelled = register_invoice(payload(25), user, db, "pending-cancelled")
+    cancel_invoice(cancelled["id"], user, db)
+
+    db.execute(
+        delete(InventoryMovement).where(
+            InventoryMovement.reference_id.in_(
+                [str(missing["id"]), str(failed["id"]), str(processing["id"])]
+            )
+        )
+    )
+    partial_movement = movement_for(db, partial["id"], "invoice_registered")
+    partial_movement.after_value = {
+        **partial_movement.after_value,
+        "physical_confirmed": partial_movement.before_value["physical_confirmed"] - 4,
+    }
+    failed_invoice = db.get(Invoice, failed["id"])
+    failed_invoice.inventory_status = "error"
+    failed_invoice.inventory_last_error = "No se pudo guardar el movimiento"
+    processing_invoice = db.get(Invoice, processing["id"])
+    processing_invoice.inventory_status = "processing"
+    position.physical_confirmed += 36
+    db.commit()
+    position_before = position.physical_confirmed
+    movement_count = len(db.scalars(select(InventoryMovement)).all())
+
+    result = pending_inventory_invoices(
+        user,
+        db,
+        search=None,
+        sequence=None,
+        purchase_order=None,
+        chain=None,
+        date_from=None,
+        date_to=None,
+        status=None,
+        page=1,
+        page_size=25,
+    )
+    by_number = {item["invoice_number"]: item for item in result["items"]}
+
+    assert result["read_only"] is True
+    assert result["summary"] == {
+        "pending_invoices": 4,
+        "pending_complete": 1,
+        "pending_partial": 1,
+        "errors": 1,
+        "processing": 1,
+        "pending_units": 36,
+    }
+    assert set(by_number) == {
+        missing["invoice_number"],
+        partial["invoice_number"],
+        failed["invoice_number"],
+        processing["invoice_number"],
+    }
+    assert by_number[missing["invoice_number"]]["status"] == "pending_complete"
+    assert by_number[partial["invoice_number"]]["status"] == "pending_partial"
+    assert by_number[partial["invoice_number"]]["lines"][0]["pending_units"] == 6
+    assert by_number[failed["invoice_number"]]["error"] == (
+        "No se pudo guardar el movimiento"
+    )
+    assert by_number[processing["invoice_number"]]["status"] == "processing"
+    db.refresh(position)
+    assert position.physical_confirmed == position_before
+    assert len(db.scalars(select(InventoryMovement)).all()) == movement_count
+    db.close()
+
+
 def test_listing_orders_numeric_sequence_keeps_void_and_reports_gap() -> None:
     engine, db, user, _warehouse, _product, _position = database()
     register_invoice(payload(10), user, db, "sequence-10")
@@ -278,6 +356,26 @@ def test_listing_orders_numeric_sequence_keeps_void_and_reports_gap() -> None:
     assert result["items"][1]["administrative_status"] == "cancelled"
     assert result["missing_sequences"] == ["001-001-000000013"]
     assert query_count <= 6
+    descending = invoice_listing(
+        user,
+        db,
+        search=None,
+        purchase_order=None,
+        chain=None,
+        date_from=None,
+        date_to=None,
+        status=None,
+        inventory_status=None,
+        sort="sequence_desc",
+        page=1,
+        page_size=25,
+    )
+    assert [item["invoice_number"] for item in descending["items"]] == [
+        "001-001-000000014",
+        "001-001-000000012",
+        "001-001-000000011",
+        "001-001-000000010",
+    ]
     db.close()
 
 

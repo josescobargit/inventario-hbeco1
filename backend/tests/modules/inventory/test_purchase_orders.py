@@ -1,20 +1,31 @@
 from datetime import date
+from decimal import Decimal
 import uuid
 
 import pytest
 from fastapi import HTTPException
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
+from sqlalchemy.pool import StaticPool
 
+from app.core.database import Base
+from app.modules.catalog.infrastructure.models import Product
+from app.modules.inventory.infrastructure.models import InventoryPositionModel, Warehouse
+from app.modules.invoices.infrastructure.models import Invoice, InvoiceLine
 from app.modules.purchase_orders.api.router import (
     LineInput,
     OrderInput,
     audit_value,
     canonical_chain_name,
+    detail,
     fulfillment_status,
     validate_line_conversion,
     validate_traceable_line_change,
 )
 from app.modules.purchase_orders.api import router as purchase_order_router
 from app.modules.purchase_orders.infrastructure.models import (
+    PurchaseOrder,
+    PurchaseOrderLine,
     PurchaseOrderSourceDocument,
 )
 
@@ -127,3 +138,121 @@ def test_edit_revalidates_box_conversion() -> None:
 
 def test_audit_history_serializes_dates() -> None:
     assert audit_value(date(2026, 7, 27)) == "2026-07-27"
+
+
+def test_purchase_order_detail_accumulates_active_invoices_in_units() -> None:
+    engine = create_engine(
+        "sqlite+pysqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    db = Session(engine)
+    user_id = uuid.uuid4()
+    warehouse = Warehouse(code="principal", name="Principal")
+    ordered_product = Product(
+        sku="BOX-1",
+        name="Producto en cajas",
+        category="Prueba",
+        cost=Decimal("1"),
+        units_per_box=12,
+    )
+    outside_product = Product(
+        sku="OUT-1",
+        name="Producto fuera de OC",
+        category="Prueba",
+        cost=Decimal("1"),
+        units_per_box=1,
+    )
+    db.add_all([warehouse, ordered_product, outside_product])
+    db.flush()
+    db.add_all(
+        [
+            InventoryPositionModel(
+                warehouse_id=warehouse.id,
+                product_id=product.id,
+                physical_confirmed=1000,
+            )
+            for product in (ordered_product, outside_product)
+        ]
+    )
+    order = PurchaseOrder(
+        chain_name="Cadena",
+        customer_name="Cadena",
+        order_number="OC-UNIDADES",
+        order_date=date(2026, 7, 20),
+        status="open",
+        created_by_user_id=user_id,
+    )
+    db.add(order)
+    db.flush()
+    db.add(
+        PurchaseOrderLine(
+            purchase_order_id=order.id,
+            product_id=ordered_product.id,
+            ordered_quantity=300,
+            original_quantity=25,
+            original_unit="boxes",
+            units_per_box=12,
+            conversion_confirmed=True,
+        )
+    )
+    invoices = []
+    for sequence, status in ((1, "confirmed"), (2, "confirmed"), (3, "cancelled")):
+        invoice = Invoice(
+            invoice_number=f"001-001-{sequence:09d}",
+            invoice_date=date(2026, 7, 21),
+            purchase_order_id=order.id,
+            source_type="purchase_order",
+            customer_name="Cadena",
+            chain_name="Cadena",
+            administrative_status=status,
+            created_by_user_id=user_id,
+        )
+        db.add(invoice)
+        db.flush()
+        invoices.append(invoice)
+    db.add_all(
+        [
+            InvoiceLine(
+                invoice_id=invoices[0].id,
+                product_id=ordered_product.id,
+                quantity=120,
+            ),
+            InvoiceLine(
+                invoice_id=invoices[1].id,
+                product_id=ordered_product.id,
+                quantity=200,
+            ),
+            InvoiceLine(
+                invoice_id=invoices[1].id,
+                product_id=outside_product.id,
+                quantity=5,
+                outside_purchase_order=True,
+            ),
+            InvoiceLine(
+                invoice_id=invoices[2].id,
+                product_id=ordered_product.id,
+                quantity=100,
+            ),
+        ]
+    )
+    db.commit()
+
+    result = detail(db, order)
+    by_sku = {line["sku"]: line for line in result["lines"]}
+
+    assert by_sku["BOX-1"]["ordered_quantity"] == 300
+    assert by_sku["BOX-1"]["invoiced_quantity"] == 320
+    assert by_sku["BOX-1"]["excess_invoice_quantity"] == 20
+    assert len(by_sku["BOX-1"]["invoice_breakdown"]) == 2
+    assert by_sku["OUT-1"]["billing_comparison_result"] == (
+        "Producto facturado no incluido en la OC"
+    )
+    assert result["billing_summary"]["ordered_units"] == 300
+    assert result["billing_summary"]["invoiced_units"] == 325
+    assert result["billing_summary"]["excess_units"] == 25
+    assert result["billing_summary"]["result"] == (
+        "Tiene diferencias que requieren revisión"
+    )
+    db.close()

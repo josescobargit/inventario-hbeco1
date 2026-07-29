@@ -24,7 +24,22 @@ interface InvoiceSummary {
     difference: number;
   };
 }
-interface InvoiceListing { items: InvoiceSummary[]; page: number; pages: number; total: number; missing_sequences: string[] }
+interface InvoiceListing {
+  items: InvoiceSummary[];
+  page: number;
+  pages: number;
+  total: number;
+  missing_sequences: string[];
+  summary: {
+    invoices: number;
+    missing: number;
+    partial: number;
+    errors: number;
+    discounted: number;
+    cancelled: number;
+    pending_units: number;
+  };
+}
 interface InventoryAudit {
   summary: { reviewed: number; correct: number; missing: number; partial: number; duplicate: number; over: number; cancelled_correct: number; cancelled_missing_reversal: number; errors: number };
   items: Array<{ id: string; invoice_number: string; invoice_date: string; invoiced_units: number; discounted_units: number; difference: number; status: string; status_label: string }>;
@@ -110,6 +125,9 @@ export function InvoiceCenter() {
   const [page, setPage] = useState(1);
   const [pages, setPages] = useState(1);
   const [totalInvoices, setTotalInvoices] = useState(0);
+  const [listingSummary, setListingSummary] = useState<InvoiceListing["summary"]>({
+    invoices: 0, missing: 0, partial: 0, errors: 0, discounted: 0, cancelled: 0, pending_units: 0,
+  });
   const [missingSequences, setMissingSequences] = useState<string[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [trace, setTrace] = useState<Traceability | null>(null);
@@ -125,9 +143,11 @@ export function InvoiceCenter() {
   const [correctionPreview, setCorrectionPreview] = useState<CorrectionPreview | null>(null);
   const [auditLoading, setAuditLoading] = useState(false);
   const [loading, setLoading] = useState(true);
-  const [detailLoading, setDetailLoading] = useState(true);
+  const [listError, setListError] = useState(false);
+  const [detailLoading, setDetailLoading] = useState(false);
   const [error, setError] = useState<string | null>(prepared.error);
   const [showForm, setShowForm] = useState(Boolean(prepared.template));
+  const [activeView, setActiveView] = useState<"all" | "missing" | "partial" | "error" | "discounted" | "cancelled">("all");
   const [template, setTemplate] = useState<InvoiceTemplate | null>(prepared.template);
   const [editing, setEditing] = useState(false);
   const [success, setSuccess] = useState<string | null>(null);
@@ -149,11 +169,18 @@ export function InvoiceCenter() {
         setInvoices(data.items);
         setPages(data.pages);
         setTotalInvoices(data.total);
+        setListingSummary(data.summary ?? {
+          invoices: data.total, missing: 0, partial: 0, errors: 0, discounted: 0, cancelled: 0, pending_units: 0,
+        });
         setMissingSequences(data.missing_sequences);
-        setSelectedId((current) => data.items.some((item) => item.id === (requestedId ?? current)) ? requestedId ?? current : data.items[0]?.id ?? null);
-        if (data.items.length === 0) setDetailLoading(false);
+        setListError(false);
+        if (requestedId && data.items.some((item) => item.id === requestedId)) {
+          setTrace(null);
+          setDetailLoading(true);
+          setSelectedId(requestedId);
+        }
       })
-      .catch((caught) => setError(caught instanceof Error ? caught.message : "No pudimos cargar las facturas."))
+      .catch(() => setListError(true))
       .finally(() => setLoading(false));
   }, [page, sort, search, orderSearch, chainFilter, dateFrom, dateTo, statusFilter, inventoryFilter]);
 
@@ -174,6 +201,29 @@ export function InvoiceCenter() {
     setDetailLoading(true);
     setSelectedId(id);
   };
+  const selectView = (view: typeof activeView) => {
+    setActiveView(view);
+    setPage(1);
+    if (view === "all") {
+      setStatusFilter("");
+      setInventoryFilter("");
+    } else if (view === "missing") {
+      setStatusFilter("confirmed");
+      setInventoryFilter("missing");
+    } else if (view === "partial") {
+      setStatusFilter("confirmed");
+      setInventoryFilter("partial");
+    } else if (view === "error") {
+      setStatusFilter("");
+      setInventoryFilter("error");
+    } else if (view === "discounted") {
+      setStatusFilter("confirmed");
+      setInventoryFilter("correct");
+    } else {
+      setStatusFilter("cancelled");
+      setInventoryFilter("");
+    }
+  };
 
   const invoiceCreated = async (id: string) => {
     // The POST has already committed at this point. Close the form and select
@@ -183,6 +233,7 @@ export function InvoiceCenter() {
     setTemplate(null);
     setEditing(false);
     selectInvoice(id);
+    window.dispatchEvent(new CustomEvent("inventario:invoice-saved", { detail: { id } }));
     setSuccess("Factura registrada correctamente");
     setError(null);
     try {
@@ -281,7 +332,7 @@ export function InvoiceCenter() {
     if (!window.confirm(`Se descontará únicamente la diferencia de ${correctionPreview.correctable.length} facturas. ¿Continuar?`)) return;
     setAuditLoading(true);
     try {
-      const result = await apiRequest<{ corrected: number; errors: number; inventory_affected: Array<{ sku: string; physical_confirmed: number; available_to_invoice: number }> }>("/invoices/inventory-audit/corrections", {
+      const result = await apiRequest<{ processed: number; corrected: number; errors: number; skipped: number; inventory_affected: Array<{ sku: string; physical_confirmed: number; available_to_invoice: number }> }>("/invoices/inventory-audit/corrections", {
         method: "POST",
         body: JSON.stringify({
           confirmation: "CORREGIR",
@@ -289,7 +340,7 @@ export function InvoiceCenter() {
           reason: reason.trim(),
         }),
       });
-      setSuccess(`${result.corrected} facturas corregidas${result.errors ? ` · ${result.errors} con error` : ""}`);
+      setSuccess(`${result.processed} facturas procesadas · ${result.corrected} descontadas correctamente${result.errors || result.skipped ? ` · ${result.errors + result.skipped} permanecen con error o revisión` : ""}`);
       setCorrectionPreview(null);
       await Promise.all([runInventoryAudit(), loadInvoices()]);
       window.dispatchEvent(new CustomEvent("inventario:inventory-changed", { detail: result.inventory_affected }));
@@ -300,23 +351,52 @@ export function InvoiceCenter() {
     }
   };
 
+  const duplicateInvoice = async (id: string) => {
+    setError(null);
+    setDetailLoading(true);
+    try {
+      const loaded = await apiRequest<Traceability>(`/invoices/${id}/traceability`);
+      setTrace(loaded);
+      setSelectedId(id);
+      populateFromTrace(false, loaded);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "No pudimos preparar el duplicado.");
+    } finally {
+      setDetailLoading(false);
+    }
+  };
+
+  const reviewPending = async () => {
+    await runInventoryAudit();
+    await previewCorrections();
+  };
+
   return (
     <main className="dashboard invoice-center">
       <section className="module-heading">
-        <div className="welcome-block"><p className="eyebrow">Trazabilidad documental y operativa</p><h1>Centro de Facturas</h1><p>Aquí no se factura: se verifica qué ocurrió desde la OC hasta la entrega, incluyendo diferencias, incidencias y devoluciones.</p></div>
-        <button className="primary-button" type="button" onClick={() => { setShowForm((value) => !value); setTemplate(null); setEditing(false); setError(null); }}>{showForm ? "Volver al centro" : "Registrar factura"}</button>
+        <div className="welcome-block"><p className="eyebrow">Trazabilidad documental y operativa</p><h1>Centro de Facturas</h1><p>Listado secuencial de facturas, estado del inventario y acceso a su trazabilidad.</p></div>
+        <div className="invoice-view-actions">{!showForm && <button className="secondary-button" type="button" disabled={auditLoading} onClick={() => void reviewPending()}>{auditLoading ? "Revisando…" : "Revisar y descontar pendientes"}</button>}<button className="primary-button" type="button" onClick={() => { setShowForm((value) => !value); setTemplate(null); setEditing(false); setError(null); }}>{showForm ? "Volver al centro" : "Registrar factura"}</button></div>
       </section>
 
       {success && <div className="message success" role="status">{success}</div>}
       {error && <div className="message error" role="alert">{error}</div>}
       {showForm ? <InvoiceRegistrationForm onCreated={invoiceCreated} onCancel={() => { setShowForm(false); setTemplate(null); setEditing(false); }} template={template} editing={editing} /> : <section className="invoice-workspace">
-        <section className="invoice-audit-panel">
-          <div><h2>Auditoría de inventario</h2><p>La consulta es de solo lectura. Ningún movimiento se corrige sin vista previa y confirmación.</p></div>
-          <div className="form-actions"><button className="secondary-button" type="button" disabled={auditLoading} onClick={() => void runInventoryAudit()}>{auditLoading ? "Revisando…" : "Auditar facturas"}</button>{audit && <button className="secondary-button" type="button" disabled={auditLoading} onClick={() => void previewCorrections()}>Corregir movimientos pendientes</button>}</div>
-          {audit && <><div className="metric-grid invoice-audit-summary"><article><span>Facturas revisadas</span><strong>{audit.summary.reviewed}</strong></article><article><span>Correctas</span><strong>{audit.summary.correct}</strong></article><article><span>Sin movimiento</span><strong>{audit.summary.missing}</strong></article><article><span>Parciales</span><strong>{audit.summary.partial}</strong></article><article><span>Duplicadas</span><strong>{audit.summary.duplicate}</strong></article></div>
-            {audit.items.some((item) => !["correct", "cancelled_correct"].includes(item.status)) && <div className="audit-problems">{audit.items.filter((item) => !["correct", "cancelled_correct"].includes(item.status)).map((item) => <span key={item.id}><strong>{item.invoice_number}</strong> · {item.status_label} · diferencia {item.difference}</span>)}</div>}</>}
-          {correctionPreview && <div className="correction-preview"><h3>Vista previa</h3>{correctionPreview.correctable.map((item) => <p key={item.id}><strong>{item.invoice_number}</strong>: salida pendiente de {item.units_to_discount} unidades</p>)}{correctionPreview.blocked.map((item) => <p key={item.id} className="error"><strong>{item.invoice_number}</strong>: {item.status_label}; requiere revisión manual</p>)}<div className="form-actions"><button type="button" className="secondary-button" onClick={() => setCorrectionPreview(null)}>Volver</button><button type="button" className="primary-button" disabled={!correctionPreview.will_change_inventory || auditLoading} onClick={() => void applyCorrections()}>Confirmar y corregir diferencias</button></div></div>}
-        </section>
+        {(audit || correctionPreview) && <section className="invoice-audit-panel" aria-label="Vista previa de corrección">
+          <div><h2>Auditoría de inventario</h2><p>Vista de solo lectura. No se modificará inventario hasta confirmar expresamente.</p></div>
+          {audit && <><div className="metric-grid invoice-audit-summary"><article><span>Revisadas</span><strong>{audit.summary.reviewed}</strong></article><article><span>Descontadas</span><strong>{audit.summary.correct}</strong></article><article><span>Sin descontar</span><strong>{audit.summary.missing}</strong></article><article><span>Parciales</span><strong>{audit.summary.partial}</strong></article><article><span>Bloqueadas</span><strong>{audit.summary.duplicate + audit.summary.over + audit.summary.errors}</strong></article></div>
+            {audit.items.some((item) => !["correct", "cancelled_correct"].includes(item.status)) && <div className="audit-problems">{audit.items.filter((item) => !["correct", "cancelled_correct"].includes(item.status)).map((item) => <span key={item.id}><strong>{item.invoice_number}</strong> · {item.invoiced_units} facturadas · {item.discounted_units} descontadas · {Math.max(item.difference, 0)} pendientes · {item.status_label}</span>)}</div>}</>}
+          {correctionPreview && <div className="correction-preview"><h3>Vista previa antes de descontar</h3>{correctionPreview.correctable.map((item) => <p key={item.id}><strong>{item.invoice_number}</strong>: descontar únicamente {item.units_to_discount} unidades pendientes</p>)}{correctionPreview.blocked.map((item) => <p key={item.id} className="error"><strong>{item.invoice_number}</strong>: {item.status_label}; bloqueada para revisión manual</p>)}<div className="form-actions"><button type="button" className="secondary-button" onClick={() => { setCorrectionPreview(null); setAudit(null); }}>Cancelar</button><button type="button" className="primary-button" disabled={!correctionPreview.will_change_inventory || auditLoading} onClick={() => void applyCorrections()}>Confirmar y descontar pendientes</button></div></div>}
+        </section>}
+
+        <nav className="invoice-status-tabs" aria-label="Filtrar facturas por inventario">{([
+          ["all", "Todas", listingSummary.invoices],
+          ["missing", "Sin descontar", listingSummary.missing],
+          ["partial", "Parciales", listingSummary.partial],
+          ["error", "Con error", listingSummary.errors],
+          ["discounted", "Descontadas", listingSummary.discounted],
+          ["cancelled", "Anuladas", listingSummary.cancelled],
+        ] as const).map(([value, text, count]) => <button key={value} type="button" className={activeView === value ? "active" : ""} onClick={() => selectView(value)}>{text}<span>{count}</span></button>)}</nav>
+        <section className="invoice-listing-summary" aria-label="Resumen de facturas"><strong>{listingSummary.invoices} facturas</strong><span>{listingSummary.missing} sin descontar</span><span>{listingSummary.partial} parciales</span><span>{listingSummary.discounted} descontadas</span><span>{listingSummary.pending_units.toLocaleString("es-EC")} unidades pendientes</span></section>
 
         <section className="invoice-compact-list" aria-label="Facturas registradas">
           <div className="invoice-filter-grid">
@@ -326,18 +406,19 @@ export function InvoiceCenter() {
             <label className="search-field"><span>Desde</span><input type="date" value={dateFrom} onChange={(event) => { setPage(1); setDateFrom(event.target.value); }} /></label>
             <label className="search-field"><span>Hasta</span><input type="date" value={dateTo} onChange={(event) => { setPage(1); setDateTo(event.target.value); }} /></label>
             <label className="search-field"><span>Estado</span><select value={statusFilter} onChange={(event) => { setPage(1); setStatusFilter(event.target.value); }}><option value="">Todos</option><option value="confirmed">Confirmadas</option><option value="cancelled">Anuladas</option></select></label>
-            <label className="search-field"><span>Inventario</span><select value={inventoryFilter} onChange={(event) => { setPage(1); setInventoryFilter(event.target.value); }}><option value="">Todos</option><option value="correct">Descontado</option><option value="missing">Pendiente</option><option value="partial">Parcial</option><option value="duplicate">Duplicado</option><option value="cancelled_correct">Revertido</option></select></label>
-            <label className="search-field"><span>Orden</span><select value={sort} onChange={(event) => { setPage(1); setSort(event.target.value); }}><option value="sequence">Secuencia ascendente</option><option value="recent">Más recientes primero</option><option value="oldest">Más antiguas primero</option></select></label>
+            <label className="search-field"><span>Inventario</span><select value={inventoryFilter} onChange={(event) => { setPage(1); setInventoryFilter(event.target.value); }}><option value="">Todos</option><option value="correct">Descontado</option><option value="missing">Pendiente</option><option value="partial">Parcial</option><option value="error">Error</option><option value="duplicate">Duplicado</option><option value="cancelled_correct">Revertido</option></select></label>
+            <label className="search-field"><span>Orden</span><select value={sort} onChange={(event) => { setPage(1); setSort(event.target.value); }}><option value="sequence">Secuencia ascendente</option><option value="sequence_desc">Secuencia descendente</option><option value="recent">Fecha más reciente</option></select></label>
           </div>
           {missingSequences.length > 0 && <div className="message info">{missingSequences.slice(0, 3).map((number) => <span key={number}>Falta revisar la factura {number}. </span>)}</div>}
           {loading && <div className="table-message">Cargando facturas…</div>}
-          {!loading && <div className="table-scroll invoice-table-scroll"><table className="compact-table"><thead><tr><th>Factura</th><th>Fecha</th><th>Cadena</th><th>OC</th><th>Productos</th><th>Unidades</th><th>Estado</th><th>Inventario</th><th>Acciones</th></tr></thead><tbody>{invoices.map((item) => <tr key={item.id} className={selectedId === item.id ? "selected-row" : ""}><td><strong>{item.invoice_number}</strong></td><td>{formatDate(item.invoice_date)}</td><td>{item.chain_name ?? item.customer_name}</td><td>{item.purchase_order_number ?? "—"}</td><td>{item.product_count}</td><td>{item.units}</td><td>{item.administrative_status === "cancelled" ? "Anulada" : "Confirmada"}</td><td><span className={`status-pill invoice-${item.inventory.status}`}>{item.inventory.status_label}</span></td><td><div className="table-actions"><button type="button" onClick={() => selectInvoice(item.id)}>Ver</button><button type="button" onClick={() => void editInvoice(item.id)}>Editar</button>{item.administrative_status !== "cancelled" && <button type="button" disabled={cancelling} onClick={() => void cancelInvoiceById(item.id, item.invoice_number)}>Anular</button>}<button type="button" onClick={() => { sessionStorage.setItem("inventario.movementInvoiceId", item.id); window.dispatchEvent(new CustomEvent("inventario:navigate", { detail: "movements" })); }}>Ver movimientos</button>{item.purchase_order_id && <button type="button" onClick={() => { sessionStorage.setItem("inventario.openPurchaseOrderId", item.purchase_order_id!); window.dispatchEvent(new CustomEvent("inventario:navigate", { detail: "orders" })); }}>Ver OC</button>}<button type="button" onClick={() => { sessionStorage.setItem("inventario.deliveryInvoiceId", item.id); window.dispatchEvent(new CustomEvent("inventario:navigate", { detail: "deliveries" })); }}>Ver entrega</button></div></td></tr>)}</tbody></table>{invoices.length === 0 && <div className="table-message">No encontramos facturas.</div>}</div>}
-          <div className="pagination-bar"><span>{totalInvoices} facturas</span><button type="button" disabled={page <= 1} onClick={() => setPage((value) => value - 1)}>Anterior</button><span>Página {page} de {pages}</span><button type="button" disabled={page >= pages} onClick={() => setPage((value) => value + 1)}>Siguiente</button></div>
+          {!loading && listError && <div className="table-message error invoice-load-error"><strong>No se pudieron cargar las facturas.</strong><button className="secondary-button" type="button" onClick={() => { setLoading(true); void loadInvoices(); }}>Reintentar</button></div>}
+          {!loading && !listError && <div className="table-scroll invoice-table-scroll"><table className="compact-table"><thead><tr><th>Factura</th><th>Fecha</th><th>Cadena</th><th>OC</th><th>Productos</th><th>Unidades</th><th>Estado</th><th>Inventario</th><th><span className="sr-only">Acciones</span></th></tr></thead><tbody>{invoices.map((item) => <tr key={item.id} className={selectedId === item.id ? "selected-row" : ""} tabIndex={0} onClick={() => selectInvoice(item.id)} onKeyDown={(event) => { if (event.key === "Enter") selectInvoice(item.id); }}><td><strong>{item.invoice_number}</strong></td><td>{formatDate(item.invoice_date)}</td><td>{item.chain_name ?? item.customer_name}</td><td>{item.purchase_order_number ?? "—"}</td><td>{item.product_count}</td><td>{item.units}</td><td>{item.administrative_status === "cancelled" ? "Anulada" : "Confirmada"}</td><td><span className={`status-pill invoice-${item.inventory.status}`}>{item.administrative_status === "cancelled" ? "No aplica: anulada" : item.inventory.status_label}</span></td><td onClick={(event) => event.stopPropagation()}><details className="invoice-action-menu"><summary aria-label={`Acciones de ${item.invoice_number}`}>⋮</summary><div><button type="button" onClick={() => selectInvoice(item.id)}>Ver detalle</button><button type="button" onClick={() => void editInvoice(item.id)}>Editar</button>{item.purchase_order_id && <button type="button" onClick={() => { sessionStorage.setItem("inventario.openPurchaseOrderId", item.purchase_order_id!); window.dispatchEvent(new CustomEvent("inventario:navigate", { detail: "orders" })); }}>Ver OC</button>}<button type="button" onClick={() => { sessionStorage.setItem("inventario.movementInvoiceId", item.id); window.dispatchEvent(new CustomEvent("inventario:navigate", { detail: "movements" })); }}>Ver movimientos</button><button type="button" onClick={() => { sessionStorage.setItem("inventario.deliveryInvoiceId", item.id); window.dispatchEvent(new CustomEvent("inventario:navigate", { detail: "deliveries" })); }}>Ver entrega</button><button type="button" onClick={() => void duplicateInvoice(item.id)}>Duplicar</button>{item.administrative_status !== "cancelled" && <button className="danger-text" type="button" disabled={cancelling} onClick={() => void cancelInvoiceById(item.id, item.invoice_number)}>Anular</button>}</div></details></td></tr>)}</tbody></table>{invoices.length === 0 && <div className="table-message">No se encontraron facturas con estos filtros.</div>}</div>}
+          {!listError && <div className="pagination-bar"><span>{totalInvoices} facturas</span><button type="button" disabled={page <= 1} onClick={() => setPage((value) => value - 1)}>Anterior</button><span>Página {page} de {pages}</span><button type="button" disabled={page >= pages} onClick={() => setPage((value) => value + 1)}>Siguiente</button></div>}
         </section>
 
-        <div className="invoice-detail">
+        {(selectedId || detailLoading) && <aside className="invoice-detail-drawer" aria-label="Detalle de factura">
+          <button className="drawer-close" type="button" aria-label="Cerrar detalle" onClick={() => { setSelectedId(null); setTrace(null); setDetailLoading(false); }}>×</button>
           {detailLoading && <div className="table-message">Armando la trazabilidad…</div>}
-          {!detailLoading && !trace && <div className="empty-detail"><strong>Selecciona una factura</strong><span>Verás su OC, productos, despacho, entrega y novedades.</span></div>}
           {!detailLoading && trace && <>
             <header className="detail-header">
               <div><p className="eyebrow">Factura externa registrada</p><h2>{trace.invoice.number}</h2><p>{trace.invoice.customer} · {formatDate(trace.invoice.date)}</p></div>
@@ -355,7 +436,7 @@ export function InvoiceCenter() {
             {trace.deliveries.length > 0 && <section className="trace-section"><h3>Entregas al cliente</h3><div className="event-list">{trace.deliveries.map((item) => <article key={item.id}><strong>{label(item.delivery_type)}</strong><p>{formatDate(item.delivered_at)} · {item.recipient ?? "Receptor no indicado"}</p>{item.notes && <small>{item.notes}</small>}</article>)}</div></section>}
             {(trace.returns.length > 0 || trace.adjustments.length > 0) && <section className="trace-section"><h3>Devoluciones y documentos relacionados</h3><div className="event-list">{trace.returns.map((item) => <article key={item.id}><strong>Devolución · {formatDate(item.returned_at)}</strong><p>{item.reason}</p><span>{item.lines.map((line) => `${line.sku}: ${line.quantity} (${label(line.disposition)})`).join(" · ")}</span></article>)}{trace.adjustments.map((item) => <article key={item.id}><strong>{label(item.document_type)} {item.document_number}</strong><p>{item.reason}</p><span>{formatDate(item.document_date)} · {formatMoney(item.value)}</span></article>)}</div></section>}
           </>}
-        </div>
+        </aside>}
       </section>}
     </main>
   );
