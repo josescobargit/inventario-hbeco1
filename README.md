@@ -96,3 +96,18 @@ El principal aplica ajustes individuales directamente, siempre con motivo, movim
 ## Entradas y salidas generales
 
 Las entradas y salidas generales registran movimientos físicos con fecha, responsable, documento y motivo. Una salida sólo puede consumir disponibilidad libre; nunca toma unidades reservadas, facturadas pendientes o bloqueadas. Los despachos a clientes permanecen separados y vinculados a sus facturas.
+
+## Control comercial
+
+La pantalla inicial reúne documentos, cruces OC/facturas, faltantes, Sell In/Out,
+maestro ampliado, histórico, alertas, asistente y exportaciones Excel/PDF.
+El panel anterior permanece disponible como **Panel operativo**.
+
+Antes de iniciar una versión actualizada, ejecutar `make db-schema` y
+`make db-check`. El asistente analítico local no requiere una API externa;
+la interpretación con IA se habilita mediante las variables documentadas en
+`.env.example`.
+
+Consultar [reglas, alcance y límites del centro comercial](docs/business-rules/commercial-control.md)
+antes de validar los documentos de cada cadena. Las importaciones comerciales
+no modifican existencias físicas.

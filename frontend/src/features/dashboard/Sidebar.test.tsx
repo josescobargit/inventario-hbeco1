@@ -7,6 +7,8 @@ describe("Sidebar", () => {
   it("agrupa la navegación y conserva nombres completos", () => {
     const navigate = vi.fn();
     render(<Sidebar activeModule="dashboard" open={false} onNavigate={navigate} onClose={vi.fn()} />);
+    expect(screen.queryByRole("heading", { name: "Operación" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Más funciones" }));
     expect(screen.getByRole("heading", { name: "Operación" })).toBeVisible();
     expect(screen.getByRole("heading", { name: "Ventas y pedidos" })).toBeVisible();
     expect(screen.getByRole("heading", { name: "Análisis" })).toBeVisible();
