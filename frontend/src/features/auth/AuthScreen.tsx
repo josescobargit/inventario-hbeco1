@@ -66,16 +66,23 @@ export function AuthScreen({
           password: form.get("password"),
         }),
       });
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "No pudimos ingresar.");
+      setSubmitting(false);
+      return;
+    }
+
+    try {
       const confirmedUser = await apiRequest<AuthenticatedUser>("/auth/me");
       onAuthenticated(confirmedUser);
     } catch (caught) {
-      if (caught instanceof ApiError && caught.status === 401) {
-        setError(
-          "No pudimos confirmar la sesión. Intenta nuevamente en unos segundos.",
-        );
-      } else {
-        setError(caught instanceof Error ? caught.message : "No pudimos ingresar.");
-      }
+      setError(
+        caught instanceof ApiError && caught.status === 401
+          ? "Los datos son correctos, pero el navegador no pudo conservar la sesión. Recarga la página e intenta nuevamente."
+          : caught instanceof Error
+            ? caught.message
+            : "No pudimos confirmar la sesión.",
+      );
     } finally {
       setSubmitting(false);
     }
