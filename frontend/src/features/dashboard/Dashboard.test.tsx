@@ -10,6 +10,7 @@ const reportResponse = () => new Response(JSON.stringify({ inventory: { products
 const settingsResponse = () => new Response(JSON.stringify({ warehouse_name: "Bodega principal", low_stock_threshold_boxes: 1, report_default_days: 30, allow_exception_invoices: true, suggested_chains: ["Gerardo Ortiz", "Favorita", "Tía"], invoice_exception_note: "Factura para otro fin operativo", updated_at: null, updated_by: null }), { status: 200, headers: { "Content-Type": "application/json" } });
 const mockApi = () => vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
   const path = String(input);
+  if (path.includes("/commercial/processing")) return new Response(JSON.stringify({records: []}), { status: 200, headers: {"Content-Type": "application/json"} });
   if (path.includes("/dashboard/summary")) return summaryResponse();
   if (path.includes("/reports/operational")) return reportResponse();
   if (path.includes("/settings/operational")) return settingsResponse();
@@ -25,6 +26,7 @@ describe("Dashboard", () => {
 
     expect(screen.getByText("Administrador")).toBeVisible();
     expect(screen.getByRole("button", { name: "Dashboard" })).toHaveAttribute("aria-current", "page");
+    fireEvent.click(screen.getByRole("button", { name: "Más funciones" }));
     fireEvent.click(screen.getByRole("button", { name: "Inventario" }));
     expect(screen.getByRole("heading", { name: "Inventario" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Inventario" })).toHaveAttribute("aria-current", "page");
@@ -36,6 +38,7 @@ describe("Dashboard", () => {
     vi.stubGlobal("fetch", mockApi());
     render(<Dashboard user={user} onLogout={vi.fn()} />);
 
+    fireEvent.click(screen.getByRole("button", { name: "Más funciones" }));
     fireEvent.click(screen.getByRole("button", { name: "Ajustes" }));
     expect(await screen.findByRole("heading", { name: "Carga masiva" })).toBeVisible();
     expect(screen.getByRole("heading", { name: "Ajuste individual" })).toBeVisible();
@@ -45,6 +48,7 @@ describe("Dashboard", () => {
   it("muestra configuración como módulo conectado", async () => {
     vi.stubGlobal("fetch", mockApi());
     render(<Dashboard user={user} onLogout={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Más funciones" }));
     fireEvent.click(screen.getByRole("button", { name: "Configuración" }));
     expect(screen.getByRole("heading", { name: "Configuración" })).toBeVisible();
     expect(await screen.findByDisplayValue("Bodega principal")).toBeVisible();
@@ -53,17 +57,33 @@ describe("Dashboard", () => {
   it("usa las acciones rápidas como navegación interna", async () => {
     vi.stubGlobal("fetch", mockApi());
     render(<Dashboard user={user} onLogout={vi.fn()} />);
-    fireEvent.click(screen.getByRole("button", { name: "Factura" }));
+    expect(screen.queryByRole("button", { name: "Factura" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Facturación" }));
     expect(screen.getByRole("button", { name: "Facturación" })).toHaveAttribute("aria-current", "page");
-    fireEvent.click(screen.getByRole("button", { name: "Exportar" }));
+    expect(screen.queryByRole("button", { name: "Exportar" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Más funciones" }));
+    fireEvent.click(screen.getByRole("button", { name: "Reportes" }));
     expect(screen.getByRole("heading", { name: "Reportes" })).toBeVisible();
     expect(await screen.findByText("Facturado por cadena")).toBeVisible();
+  });
+
+  it("Procesar documentos tiene una entrada propia separada del Dashboard", async () => {
+    vi.stubGlobal("fetch", mockApi());
+    render(<Dashboard user={user} onLogout={vi.fn()} />);
+    fireEvent.click(screen.getAllByRole("button", { name: "Procesar documentos" })[0]!);
+    expect(await screen.findByRole("heading", { name: "Procesar documentos" })).toBeVisible();
+    expect(screen.getByLabelText("Archivos comerciales")).toBeVisible();
+    expect(screen.queryByRole("heading", { name: "Dashboard comercial" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Dashboard" }));
+    expect(await screen.findByRole("heading", { name: "Dashboard comercial" })).toBeVisible();
+    expect(screen.queryByLabelText("Archivos comerciales")).not.toBeInTheDocument();
   });
 
   it("permite colapsar y expandir la barra lateral", () => {
     vi.stubGlobal("fetch", mockApi());
     const { container } = render(<Dashboard user={user} onLogout={vi.fn()} />);
 
+    expect(container.querySelector(".authenticated-shell")).not.toHaveClass("sidebar-collapsed");
     fireEvent.click(screen.getByRole("button", { name: "Colapsar barra lateral" }));
     expect(container.querySelector(".authenticated-shell")).toHaveClass("sidebar-collapsed");
     fireEvent.click(screen.getByRole("button", { name: "Expandir barra lateral" }));

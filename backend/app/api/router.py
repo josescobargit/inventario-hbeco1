@@ -30,7 +30,10 @@ from app.modules.stock_imports.api.persistence_router import (
 from app.modules.supplier_invoices.api.router import router as supplier_invoices_router
 
 
+from app.modules.commercial.router import router as commercial_router
+
 api_router = APIRouter()
+api_router.include_router(commercial_router)
 api_router.include_router(audit_router)
 api_router.include_router(auth_router)
 api_router.include_router(catalog_router)

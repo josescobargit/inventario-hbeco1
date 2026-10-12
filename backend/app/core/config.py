@@ -2,7 +2,7 @@ from functools import lru_cache
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 from typing import Literal
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 SUPABASE_POOLER_HOST = "aws-0-us-east-1.pooler.supabase.com"
@@ -61,6 +61,10 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    commercial_ai_enabled: bool = False
+    commercial_ai_model: str | None = None
+    openai_api_key: str | None = Field(default=None, repr=False)
 
     app_name: str = "Inventario Operativo"
     environment: Literal["development", "test", "production"] = "development"

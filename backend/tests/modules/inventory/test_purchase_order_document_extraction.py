@@ -161,6 +161,94 @@ def test_splits_multiple_orders_without_mixing_documents() -> None:
     assert "PRODUCTO A" not in drafts[1]
 
 
+def test_splits_el_rosado_orders_but_not_liris_repeated_page_headers() -> None:
+    rosado = (
+        "CORPORACION EL ROSADO S. A.\nNUMERO DE ORDEN 4618533590\nITEM A\n"
+        "CORPORACION EL ROSADO S. A.\nNUMERO DE ORDEN 4618533654\nITEM B"
+    )
+    assert len(document_extraction.split_purchase_orders(rosado)) == 2
+
+    liris = (
+        "Orden de Compra OC_005918936\nLIRIS S.A.\nRUC:0990865477001\n"
+        "Fecha de Pedido: 5/10/26\nITEM A\n"
+        "Orden de Compra OC_005918936\nLIRIS S.A.\nPágina 2 de 2"
+    )
+    assert len(document_extraction.split_purchase_orders(liris)) == 1
+
+
+@pytest.mark.parametrize(
+    ("text", "chain", "order", "order_date", "buyer_ruc"),
+    [
+        (
+            "CORPORACION FAVORITA C.A. RUC: 1790016919001 "
+            "ORDEN COMPRA INIC. INDIVIDUAL 50 : 100 6274 94678 "
+            "Fecha Elabora: 01/OCT/2026",
+            "CORPORACIÓN FAVORITA",
+            "100627494678",
+            "2026-10-01",
+            "1790016919001",
+        ),
+        (
+            "PEDIDO A PROVEEDOR Orden Pedido No.: 7273840 Emisión: 29/09/2026 "
+            "Ubicación: FARCOMED VIRTUAL FARMACIAS Y COMISARIATOS DE MEDICINAS S.A. "
+            "1790710319001 05/10/2026",
+            "FARCOMED",
+            "7273840",
+            "2026-09-29",
+            "1790710319001",
+        ),
+        (
+            "GERARDO ORTIZ E HIJOS CIA RA335941 Ped. Compra: 5601875028 "
+            "RUC/Código: 1793230700001 Fecha de Envío: 2026-09-25",
+            "GERARDO ORTIZ",
+            "5601875028",
+            "2026-09-25",
+            None,
+        ),
+        (
+            "TIENDAS TUTI TTDE S.A. RUC: 0993152161001 ORDEN DE COMPRA "
+            "FECHA DEL DOCUMENTO 28.09.2026 CITA PARA ENTREGA: 4500374870",
+            "TUTI",
+            "4500374870",
+            "2026-09-28",
+            "0993152161001",
+        ),
+        (
+            "CORPORACIONELROSADOS.A. FECHADEL 2026.09.25 "
+            "NUMERODEORDEN 4618533654",
+            "CORPORACIÓN EL ROSADO",
+            "4618533654",
+            "2026-09-25",
+            None,
+        ),
+    ],
+)
+def test_known_real_order_formats_use_document_evidence(
+    text: str,
+    chain: str,
+    order: str,
+    order_date: str,
+    buyer_ruc: str | None,
+) -> None:
+    header = document_extraction.recognized_header(text, "referencia-incorrecta-999.pdf")
+    assert header["chain_name"] == chain
+    assert header["order_number"] == order
+    assert header["order_date"] == order_date
+    assert header["buyer_ruc"] == buyer_ruc
+    assert header["status"] == "OK"
+
+
+def test_tia_purchase_order_is_not_misclassified_by_delivery_instructions() -> None:
+    text = (
+        "ORDEN DE COMPRA Nº 3001037437 RUC: 0990017514001 "
+        "TIENDAS INDUSTRIALES ASOCIADAS (TIA) S.A. Fecha De La Orden: 2026-09-15 "
+        "ORDEN DE ENTREGA DE DOCUMENTO GUIA DE REMISION"
+    )
+    classification = document_extraction.classify_document(text)
+    assert classification["type"] == "purchase_order"
+    assert classification["allowed_for_purchase_order"] is True
+
+
 def test_recognizes_existing_header_fields_only() -> None:
     header = document_extraction.recognized_header(
         "ORDEN DE COMPRA OC-400\nCLIENTE: Cadena Prueba\nFECHA: 23/07/2026"

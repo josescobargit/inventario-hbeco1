@@ -18,6 +18,10 @@ from app.modules.purchase_orders.domain.table_extraction import (
     extract_pdf_table_rows,
     extract_visual_word_rows,
 )
+from app.modules.purchase_orders.domain.order_profiles import (
+    recognize_known_order,
+    split_known_orders,
+)
 
 
 ORDER_LABEL = (
@@ -73,6 +77,7 @@ class ExtractedDocument:
     warnings: tuple[str, ...] = ()
     table_rows: tuple[dict, ...] = ()
     expected_product_count: int | None = None
+    header: dict | None = None
 
 
 def _candidate_product_rows(text: str) -> int:
@@ -109,6 +114,15 @@ def extraction_signals(text: str) -> dict[str, bool | int]:
 
 def classify_document(text: str) -> dict[str, str | bool]:
     normalized = normalize_identity(text)
+    known = recognize_known_order(text)
+    if known:
+        is_request = known["chain_name"] == "FARCOMED"
+        return {
+            "type": "order_request" if is_request else "purchase_order",
+            "label": "Pedido a proveedor" if is_request else "Orden de compra",
+            "allowed_for_purchase_order": True,
+            "message": "",
+        }
     if PREVALIDATION_PATTERN.search(normalized):
         return {
             "type": "invoice_prevalidation",
@@ -305,8 +319,7 @@ def _remove_table_rules(image: Image.Image) -> Image.Image:
     columns = [
         x
         for x in range(width)
-        if sum(pixels[y * width + x] < dark_limit for y in range(height))
-        > column_limit
+        if sum(pixels[y * width + x] < dark_limit for y in range(height)) > column_limit
     ]
     for y in rows:
         start = y * width
@@ -327,8 +340,7 @@ def _recover_units_per_box_words(
         (
             index
             for index, value in enumerate(data["text"])
-            if re.sub(r"[^A-Z0-9]", "", str(value).upper())
-            in {"UXC", "UC", "URE"}
+            if re.sub(r"[^A-Z0-9]", "", str(value).upper()) in {"UXC", "UC", "URE"}
         ),
         None,
     )
@@ -429,8 +441,7 @@ def _ocr_image(
                 lines.setdefault(line_key, []).append((left, text))
             words.extend(_recover_units_per_box_words(prepared, data))
             recognized_text = "\n".join(
-                " ".join(text for _, text in sorted(line))
-                for line in lines.values()
+                " ".join(text for _, text in sorted(line)) for line in lines.values()
             )
             return (
                 recognized_text,
@@ -489,11 +500,10 @@ def _largest_embedded_page_image(
     return None
 
 
-def _extract_pdf(
-    pdf: fitz.Document, job_id: str | None = None
-) -> ExtractedDocument:
+def _extract_pdf(pdf: fitz.Document, job_id: str | None = None) -> ExtractedDocument:
     try:
-        table_rows = extract_pdf_table_rows(pdf)
+        table_rows = []
+        visual_pages = []
         pages: list[str] = []
         methods: set[str] = set()
         warnings: list[str] = []
@@ -548,7 +558,7 @@ def _extract_pdf(
                     rendered_height=rendered_height,
                 )
                 combined = _merge_page_text(direct_text, text.strip())
-                if not table_rows and ocr_words:
+                if ocr_words:
                     scale_x = float(image_rect.width) / ocr_size[0]
                     scale_y = float(image_rect.height) / ocr_size[1]
                     scaled_words = [
@@ -561,10 +571,8 @@ def _extract_pdf(
                         }
                         for word in ocr_words
                     ]
-                    table_rows.extend(
-                        extract_visual_word_rows(
-                            scaled_words, float(page.rect.width), page_number + 1
-                        )
+                    visual_pages.append(
+                        (scaled_words, float(page.rect.width), page_number + 1)
                     )
                 pages.append(f"[[PAGE:{page_number + 1}]]\n{combined}")
                 if direct_text:
@@ -594,6 +602,13 @@ def _extract_pdf(
                     page=page_number + 1,
                 )
         joined = "\n\n".join(pages)
+        # Classify the complete text before choosing the product table strategy.
+        header = recognized_header(joined)
+        table_rows = extract_pdf_table_rows(pdf)
+        digital_pages = {row.get("page") for row in table_rows}
+        for words, width, page_number in visual_pages:
+            if page_number not in digital_pages:
+                table_rows.extend(extract_visual_word_rows(words, width, page_number))
         method = "+".join(sorted(methods)) if methods else "pdf_empty"
         return ExtractedDocument(
             text=joined,
@@ -602,6 +617,7 @@ def _extract_pdf(
             warnings=tuple(warnings),
             table_rows=tuple(table_rows),
             expected_product_count=expected_product_count(joined, table_rows),
+            header=header,
         )
     finally:
         pdf.close()
@@ -610,6 +626,7 @@ def _extract_pdf(
 def _extract_image(image: Image.Image) -> ExtractedDocument:
     try:
         text, method, words, size = _ocr_image(image)
+        header = recognized_header(text)
         rows = extract_visual_word_rows(words, float(size[0]), 1) if words else []
         if not rows:
             rows = extract_known_ocr_text_rows(text)
@@ -619,6 +636,7 @@ def _extract_image(image: Image.Image) -> ExtractedDocument:
             page_count=1,
             table_rows=tuple(rows),
             expected_product_count=expected_product_count(text, rows),
+            header=header,
         )
     finally:
         image.close()
@@ -650,6 +668,9 @@ def expected_product_count(text: str, table_rows: list[dict] | tuple[dict, ...])
 
 
 def split_purchase_orders(text: str) -> list[str]:
+    known_parts = split_known_orders(text)
+    if known_parts is not None:
+        return known_parts
     matches = list(ORDER_MARKER.finditer(text))
     if len(matches) <= 1:
         return [text.strip()] if text.strip() else []
@@ -664,6 +685,9 @@ def split_purchase_orders(text: str) -> list[str]:
 def recognized_header(
     text: str, filename: str | None = None
 ) -> dict[str, str | list[str] | None]:
+    known = recognize_known_order(text)
+    if known:
+        return known
     order = ORDER_MARKER.search(text)
     reference = REFERENCE_PATTERN.search(text)
     chain = CHAIN_PATTERN.search(text)

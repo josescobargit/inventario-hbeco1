@@ -22,6 +22,9 @@ HEADER_KIND_PATTERNS = (
     ("size", re.compile(r"^(?:TAMANO|PRESENTACION|SIZE)$")),
     ("units_per_box", re.compile(r"^(?:UXC|UC|URE|U/C|UNIXCAJA)$")),
     ("quantity", re.compile(r"^(?:CANTIDAD|CANT|QTY|SOLICITADO|PEDIDO)$")),
+    ("unit_label", re.compile(r"^(?:UNIDAD|UNID|UM|UNIT)$")),
+    ("unit_price", re.compile(r"^(?:PRECIOUNITARIO|PRECIOUNIT|PUNITARIO|PUNIT)$")),
+    ("amount", re.compile(r"^(?:IMPORTE|PRECIOTOTAL|TOTALSINIMPUESTO)$")),
     ("cost", re.compile(r"^(?:COSTO|PRECIO|VALOR|COST)$")),
 )
 STOP_PATTERN = re.compile(
@@ -72,8 +75,14 @@ def _group_visual_rows(words: list[dict[str, Any]], tolerance: float = 4.5):
 def _header_columns(row: list[dict[str, Any]]) -> list[dict[str, Any]]:
     columns = []
     seen: set[str] = set()
-    for word in row:
-        kind = _header_kind(word["text"])
+    for index, word in enumerate(row):
+        joined = word["text"] + (row[index + 1]["text"] if index + 1 < len(row) else "")
+        joined_kind = _header_kind(joined)
+        kind = (
+            joined_kind
+            if joined_kind in {"unit_price", "amount"}
+            else _header_kind(word["text"])
+        )
         if kind and kind not in seen:
             columns.append(
                 {
@@ -174,6 +183,7 @@ def _extract_semantic_tables(page, page_number: int) -> list[dict[str, Any]]:
     except (AttributeError, ValueError):
         return extracted
     for table in tables:
+        table_extracted = False
         data = table.extract()
         for header_index, header in enumerate(data):
             normalized = [_normalize(cell or "") for cell in header]
@@ -261,6 +271,22 @@ def _extract_semantic_tables(page, page_number: int) -> list[dict[str, Any]]:
                 ),
                 -1,
             )
+            price_index = next(
+                (
+                    i
+                    for i, cell in enumerate(normalized)
+                    if cell in {"PRECIOUNITARIO", "PRECIOUNIT", "PUNITARIO", "PUNIT"}
+                ),
+                -1,
+            )
+            amount_index = next(
+                (
+                    i
+                    for i, cell in enumerate(normalized)
+                    if cell in {"IMPORTE", "PRECIOTOTAL", "TOTALSINIMPUESTO"}
+                ),
+                -1,
+            )
             for data_index, row in enumerate(
                 data[header_index + 1 :], header_index + 1
             ):
@@ -315,6 +341,12 @@ def _extract_semantic_tables(page, page_number: int) -> list[dict[str, Any]]:
                             else None
                         ),
                         "description": description,
+                        "unit_price": _clean_cell(cells[price_index])
+                        if 0 <= price_index < len(cells)
+                        else None,
+                        "amount": _clean_cell(cells[amount_index])
+                        if 0 <= amount_index < len(cells)
+                        else None,
                         "supplier_reference": (
                             _distinct_code(cells[reference_index])
                             if reference_index >= 0 and reference_index < len(cells)
@@ -330,10 +362,9 @@ def _extract_semantic_tables(page, page_number: int) -> list[dict[str, Any]]:
                         "source": "pdf_table",
                     }
                 )
-            if extracted:
+                table_extracted = True
+            if table_extracted:
                 break
-        if extracted:
-            break
     return extracted
 
 
@@ -366,7 +397,7 @@ def _extract_known_text_layouts(
             )
     if "CORPORACION FAVORITA" in normalized:
         pattern = re.compile(
-            r"(?m)^\s*(\d{2})\s*(.+?)\s+(\d{3}\s*m)\s+(\S+)\s+"
+            r"(?m)^\s*(\d{2})\s*(.+?)\s+(\d{2,4}\s*[um]?)\s+(\S+)\s+"
             r"(\d{13})\s+(\d+)\s+[\d.]+\s+(\d+)\s*$",
             re.IGNORECASE,
         )
@@ -384,6 +415,52 @@ def _extract_known_text_layouts(
                     "quantity": int(match.group(7)),
                     "original_unit_type": "boxes",
                     "bounds": _text_bounds(page, match.group(5)),
+                    "source": "known_text_layout",
+                }
+            )
+    if "FARCOMED VIRTUAL" in normalized:
+        pattern = re.compile(
+            r"(?m)^\s*(\d{6})\s+(\d{13})\s+(.+?)\s+([\d.]+)\s+(\d+)\s*$"
+        )
+        for match in pattern.finditer(text):
+            extracted.append(
+                {
+                    "page": page_number,
+                    "raw": match.group(0).strip(),
+                    "item_number": None,
+                    "chain_code": match.group(1),
+                    "description": _clean_cell(match.group(3)),
+                    "supplier_reference": match.group(2),
+                    "size": None,
+                    "units_per_box": None,
+                    "quantity": int(match.group(5)),
+                    "original_unit_type": "units",
+                    "bounds": _text_bounds(page, match.group(1)),
+                    "source": "known_text_layout",
+                }
+            )
+    if "INDUSTRIAL DANEC" in normalized:
+        pattern = re.compile(
+            r"(?m)^\s*(\d+)(?:[.,]00)?\s+UN\s+(\d{13})\s+(.+?)\s*-\s*"
+            r"([\d.]+)\s+\S+.*?\s+([\d,]+\.\d{2})\s*$"
+        )
+        detail_text = re.split(r"(?im)^.*?\bSubtotal\s*:", text, maxsplit=1)[0]
+        for match in pattern.finditer(detail_text):
+            extracted.append(
+                {
+                    "page": page_number,
+                    "raw": match.group(0).strip(),
+                    "item_number": None,
+                    "chain_code": match.group(2),
+                    "description": _clean_cell(match.group(3)),
+                    "supplier_reference": None,
+                    "size": None,
+                    "units_per_box": None,
+                    "quantity": int(match.group(1)),
+                    "unit_price": float(match.group(4)),
+                    "amount": match.group(5),
+                    "original_unit_type": "units",
+                    "bounds": _text_bounds(page, match.group(2)),
                     "source": "known_text_layout",
                 }
             )
@@ -428,6 +505,43 @@ def extract_known_ocr_text_rows(
             }
         )
     return extracted
+
+
+def extract_known_order_text_rows(
+    text: str, page_number: int = 1
+) -> list[dict[str, Any]]:
+    """Extract rows from text-only known layouts, including multi-order pages."""
+    normalized = normalize_identity(text)
+    if "CORPORACION EL ROSADO" not in normalized:
+        return []
+    pattern = re.compile(
+        r"(?m)^\s*(\d{2})\s+(\d{18})\s+(.+?)\s+"
+        r"([A-Z0-9]+)\s+(\S+)\s+(\d+)\s+(\d+),00\s+([\d,]+)"
+    )
+    rows: list[dict[str, Any]] = []
+    for match in pattern.finditer(text):
+        reference = match.group(4)
+        if reference.isdigit() and len(reference) == 10:
+            continuation = re.match(r"\s*\n\s*(\d{3})\b", text[match.end() :])
+            if continuation:
+                reference += continuation.group(1)
+        rows.append(
+            {
+                "page": page_number,
+                "raw": match.group(0).strip(),
+                "item_number": match.group(1),
+                "chain_code": match.group(2),
+                "description": _clean_cell(match.group(3)),
+                "supplier_reference": reference,
+                "size": match.group(5),
+                "units_per_box": int(match.group(6)),
+                "quantity": int(match.group(7)),
+                "original_unit_type": "boxes",
+                "bounds": {"x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0},
+                "source": "known_text_layout",
+            }
+        )
+    return rows
 
 
 def _text_bounds(page, needle: str) -> dict[str, float]:
@@ -528,19 +642,31 @@ def extract_visual_word_rows(
             supplier_reference += trailing_reference.group(1)
             description = description[: trailing_reference.start()].strip()
         item_match = re.search(r"\b(\d+)\b", cells.get("item", ""))
+        unit_label = _normalize(cells.get("unit_label", ""))
+        box_match = re.fullmatch(r"CAJAS?X(\d+)", unit_label)
+        factor = _first_integer(cells.get("units_per_box", ""))
+        if box_match:
+            factor = int(box_match.group(1))
+        original_unit = (
+            "boxes"
+            if factor or unit_label in {"CAJA", "CAJAS", "CJ"}
+            else "units"
+            if unit_label in {"UN", "UNIDAD", "UNIDADES", "UND", "UD"}
+            else "ambiguous"
+        )
         product = {
             "page": page_number,
             "raw": raw,
             "item_number": item_match.group(1) if item_match else None,
             "chain_code": _distinct_code(cells.get("article_code")),
             "description": description.strip(" |[]"),
+            "unit_price": cells.get("unit_price") or None,
+            "amount": cells.get("amount") or None,
             "supplier_reference": _distinct_code(supplier_reference),
             "size": size or None,
-            "units_per_box": _first_integer(cells.get("units_per_box", "")),
+            "units_per_box": factor,
             "quantity": quantity,
-            "original_unit_type": (
-                "boxes" if cells.get("units_per_box") else "ambiguous"
-            ),
+            "original_unit_type": original_unit,
             "bounds": _bounds(row),
             "source": "visual_positions",
         }
