@@ -44,14 +44,19 @@ export type Evidence = {
     revision: number;
 };
 export type Totals = {
-    ordered: number;
-    invoiced: number;
-    missing: number;
-    difference: number;
+    ordered: number | null;
+    invoiced: number | null;
+    missing: number | null;
+    difference: number | null;
+    known_ordered?: number;
+    known_invoiced?: number;
+    known_missing?: number;
     fulfillment: number | null;
     ordered_amount: number | null;
     invoiced_amount: number | null;
     unbilled_amount: number | null;
+    currency?: string | null;
+    invoiced_currency?: string | null;
 };
 export type ComparisonRow = Totals & {
     chain: string;
@@ -84,6 +89,7 @@ export type Sale = {
 export type CommercialData = {
     summary: Totals & {
         review_records: number;
+        review_documents?: number;
         excluded_records: number;
         sell_in_units: number | null;
         sell_out_units: number | null;
@@ -136,6 +142,15 @@ export type CommercialData = {
     })[]>;
     basis: string;
     executive_report: string[];
+};
+export type WeeklyReport = {
+    period: { date_from: string | null; date_to: string | null; basis?: string };
+    summary: Totals;
+    chains: (Totals & { chain: string })[];
+    critical_products: { missing: ComparisonRow[]; not_invoiced: ComparisonRow[]; economic: ComparisonRow[] };
+    alerts: Alert[];
+    counts: { orders: number; invoices: number; linked: number; pending: number; review_documents: number; excluded_invoices: number };
+    basis?: string;
 };
 export type Filters = {
     date_from: string;

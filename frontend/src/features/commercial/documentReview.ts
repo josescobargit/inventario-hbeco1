@@ -5,6 +5,9 @@ export type StoredDocument = { id: string; filename: string; warnings: string[];
 export type ImportResult = { document_id?: string; filename: string; status: string; message: string };
 export type DocumentGroup = { id: string; filename: string; records: Evidence[]; issues: string[]; status: "OK" | "REVISAR" | "ERROR"; failure?: string; needsReprocessing?: boolean };
 export function headerField(issue: string, row?: Evidence): string | undefined {
+    if (/estado administrativo/i.test(issue)) return "status";
+    if (/reemplazo/i.test(issue)) return "replaces";
+    if (/referencias? de OC|OC relacionada|referencia.*pedido/i.test(issue)) return "order_number";
     if (/cadena/i.test(issue) && /identific|ausente|inválid/i.test(issue)) return "chain";
     if (/campos pendientes de la cabecera|cabecera extraída por OCR/i.test(issue)) return "extraction_confirmed";
     if (/fecha/i.test(issue)) return "date";

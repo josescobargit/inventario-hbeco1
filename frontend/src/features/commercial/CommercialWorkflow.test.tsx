@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CommercialWorkflow } from "./CommercialWorkflow";
 import { apiRequest, apiUpload } from "../../api/client";
@@ -43,5 +43,31 @@ describe("Flujo comercial", () => {
         expect(screen.getByText("Número de OC explícito")).toBeVisible();
         fireEvent.click(screen.getByRole("button", {name:"Revisar solo excepciones"}));
         expect(screen.getByText("No hay documentos por revisar.")).toBeVisible();
+    });
+    it("conserva varias facturas de una OC y muestra sus importes y anulación documental", async () => {
+        const second = {...invoice, id: "i2", document_id: "d3", number: "001-001-000000002", excluded: true, administrative_status: "cancelled", financials: {subtotal: 20, discount: 1, tax: 2.85, total: 21.85, currency: "USD"}};
+        vi.mocked(apiRequest).mockResolvedValue({...data, invoices: [invoice, second], summary: {...data.summary, excluded_invoices: 1}});
+        render(<CommercialWorkflow mode="invoices" advanced={null} />);
+        await screen.findByText("Facturas detectadas");
+        expect(screen.getByRole("button", {name: /Factura 001-001-000000001/})).toBeVisible();
+        fireEvent.click(screen.getByRole("button", {name: /Factura 001-001-000000002/}));
+        expect(screen.getByText("Estado administrativo: Anulada")).toBeVisible();
+        const financials = screen.getByLabelText("Datos de la factura");
+        expect(within(financials).getByText("Subtotal")).toBeVisible();
+        expect(within(financials).getByText("Descuentos")).toBeVisible();
+        expect(within(financials).getByText("IVA")).toBeVisible();
+        expect(within(financials).getByText("Total factura")).toBeVisible();
+        expect(screen.getByText(/Esta factura queda fuera del comparativo/)).toBeVisible();
+        expect(screen.queryByRole("button", {name: "Guardar vínculo"})).not.toBeInTheDocument();
+    });
+    it("filtra el comparativo guardado por período sin pedir nuevos documentos", async () => {
+        vi.mocked(apiRequest).mockResolvedValue(data);
+        render(<CommercialWorkflow mode="comparisons" advanced={null} />);
+        await screen.findByRole("table", {name: "Pedido vs Facturado"});
+        fireEvent.change(screen.getByLabelText("Desde"), {target: {value: "2026-09-14"}});
+        fireEvent.change(screen.getByLabelText("Hasta"), {target: {value: "2026-09-20"}});
+        fireEvent.click(screen.getByRole("button", {name: "Aplicar período"}));
+        await waitFor(() => expect(apiRequest).toHaveBeenCalledWith("/commercial/workflow?date_from=2026-09-14&date_to=2026-09-20", expect.anything()));
+        expect(apiUpload).not.toHaveBeenCalled();
     });
 });

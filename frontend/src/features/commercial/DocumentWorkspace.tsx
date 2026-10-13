@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { apiRequest, apiUpload, apiUrl } from "../../api/client";
 import type { CommercialData, CommercialProduct, Evidence } from "./types";
 import { chains, documentValue, groupDocuments, headerField, kindNames, type DocumentGroup, type ImportResult, type StoredDocument } from "./documentReview";
-const fieldLabels: Record<string, string> = { chain: "Cadena", kind: "Tipo de documento", date: "Fecha del documento", order_number: "Número de OC", invoice_number: "Número de factura", currency: "Moneda", product_id: "Producto", product_name: "Descripción del producto", quantity: "Cantidad", unit: "Unidad", units_per_box: "Unidades por caja", total_units: "Unidades totales", amount: "Subtotal", unit_price: "Precio unitario", status: "Estado administrativo", extraction_confirmed: "Extracción verificada con el original" };
+const fieldLabels: Record<string, string> = { chain: "Cadena", kind: "Tipo de documento", date: "Fecha del documento", order_number: "Número de OC", invoice_number: "Número de factura", currency: "Moneda", product_id: "Producto", product_name: "Descripción del producto", quantity: "Cantidad", unit: "Unidad", units_per_box: "Unidades por caja", total_units: "Unidades totales", amount: "Subtotal", unit_price: "Precio unitario", status: "Estado administrativo", replaces: "Factura que reemplaza", extraction_confirmed: "Extracción verificada con el original" };
 const unitName = (value: unknown) => ({ units: "unidades", boxes: "cajas", ambiguous: "Pendiente" }[String(value)] || String(value || "Pendiente"));
 const formatDate = (value: string) => /^\d{4}-\d{2}-\d{2}$/.test(value) ? value.split("-").reverse().join("/") : value;
 export function DocumentWorkspace({ data, loading, products, onRefresh }: { data: Pick<CommercialData, "records"> | null; loading: boolean; products: CommercialProduct[]; onRefresh: () => Promise<void> }) {
@@ -64,7 +64,7 @@ export function DocumentDialog({ document: d, products, onClose, onSaved }: { do
     const [error, setError] = useState("");
     const [editing, setEditing] = useState<Evidence | null>(null);
     useEffect(() => { dialog.current?.showModal(); }, []);
-    const headers = [...new Set(d.records.flatMap(r => [...r.issues, ...r.monetary_issues].map(i => headerField(i, r))).filter((f): f is string => !!f))];
+    const headers = [...new Set([...d.issues.map(i => headerField(i, d.records[0])), ...d.records.flatMap(r => [...r.issues, ...r.monetary_issues].map(i => headerField(i, r)))].filter((f): f is string => !!f))];
     const otherIssues = d.issues.filter(i => !headerField(i, d.records[0]));
     const imported = d.records.length > 0 && d.records.every(r => r.origin === "import");
     async function save(e: React.FormEvent) {
@@ -92,7 +92,7 @@ export function DocumentDialog({ document: d, products, onClose, onSaved }: { do
     </dialog>;
 }
 function Field({ field, value, onChange, products }: { field: string; value: string | boolean; onChange: (value: string | boolean) => void; products: CommercialProduct[] }) {
-    const options = field === "chain" ? chains.map(c => [c, c]) : field === "status" ? [["excluido", "Excluir esta copia de los totales"]] : field === "kind" ? Object.entries(kindNames) : field === "product_id" ? products.map(p => [p.id, p.name]) : null;
+    const options = field === "chain" ? chains.map(c => [c, c]) : field === "status" ? [["activo", "Activa"], ["anulada", "Anulada"], ["reemplazada", "Reemplazada"], ["excluido", "Excluir esta copia de los totales"]] : field === "kind" ? Object.entries(kindNames) : field === "product_id" ? products.map(p => [p.id, p.name]) : null;
     return <label>{fieldLabels[field] || field}{options ? <select value={String(value)} onChange={e => onChange(e.target.value)}><option value="">Seleccionar…</option>{options.map(([v, label]) => <option key={v} value={v}>{label}</option>)}</select> : field === "extraction_confirmed" ? <input type="checkbox" checked={value === true} onChange={e => onChange(e.target.checked)} /> : <input type={field === "date" ? "date" : "text"} value={String(value)} onChange={e => onChange(e.target.value)} />}</label>;
 }
 function ProductException({ record: r, products, onSaved, onCancel }: { record: Evidence; products: CommercialProduct[]; onSaved: () => Promise<void>; onCancel: () => void }) {

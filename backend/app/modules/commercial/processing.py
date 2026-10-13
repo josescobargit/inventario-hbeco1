@@ -5,7 +5,7 @@ from sqlalchemy import select
 from app.modules.commercial.models import CommercialDocument, CommercialRecord
 from app.modules.commercial.normalization import KIND_MAP, identity, number, parse_date
 
-PARSER_VERSION = "documents-v5"
+PARSER_VERSION = "documents-v6-invoices"
 
 
 def recognition_evidence(row, document):
@@ -17,7 +17,7 @@ def recognition_evidence(row, document):
     kind = KIND_MAP.get(identity(raw.get("kind")))
     chain = str(raw.get("chain") or "").strip()
     when = parse_date(raw.get("date"))
-    issues = []
+    issues = list(raw.get("document_issues") or [])
     if not chain:
         issues.append("Cadena no identificada")
     if not kind:
@@ -89,7 +89,20 @@ def recognition_evidence(row, document):
         invoice_number=str(raw.get("invoice_number") or ""),
         issues=issues,
         monetary_issues=[],
-        excluded=False,
+        excluded=identity(raw.get("status"))
+        in {
+            "anulada",
+            "anulado",
+            "cancelled",
+            "canceled",
+            "void",
+            "reemplazada",
+            "reemplazado",
+            "replaced",
+            "excluido",
+        },
+        administrative_status=identity(raw.get("status") or "activo"),
+        replaces=str(raw.get("replaces") or ""),
         source={**raw, "unit": unit},
         original_source=row.source,
         revision=row.revision,

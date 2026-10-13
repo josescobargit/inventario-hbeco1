@@ -8,6 +8,65 @@ from app.modules.commercial.normalization import identity, number
 from app.modules.purchase_orders.domain.order_profiles import PROFILES
 
 
+CANCELLED_STATES = {"anulada", "anulado", "cancelled", "canceled", "void"}
+REPLACED_STATES = {"reemplazada", "reemplazado", "replaced"}
+ACTIVE_STATES = {
+    "activo",
+    "active",
+    "confirmed",
+    "confirmada",
+    "confirmado",
+    "open",
+    "completed",
+    "partially_invoiced",
+}
+
+
+def administrative_state(row):
+    raw = row.get("source", {})
+    state = identity(raw.get("status") or row.get("administrative_status") or "activo")
+    if state in CANCELLED_STATES:
+        return "cancelled"
+    if state in REPLACED_STATES:
+        return "replaced"
+    if row.get("excluded") or state == "excluido":
+        return "excluded"
+    return "active" if state in ACTIVE_STATES else "review"
+
+
+def append_issue(document, message):
+    if message not in document["issues"]:
+        document["issues"].append(message)
+
+
+def day(value):
+    try:
+        return date.fromisoformat(str(value)) if value else None
+    except ValueError:
+        return None
+
+
+def period_matches(value, start=None, end=None):
+    when = day(value)
+    return bool(
+        when and (not start or when >= day(start)) and (not end or when <= day(end))
+    )
+
+
+def document_financials(rows, currency):
+    fields = {
+        "subtotal": "document_subtotal",
+        "discount": "document_discount",
+        "tax": "document_tax",
+        "total": "document_total",
+    }
+    result = {"currency": currency}
+    for name, source_field in fields.items():
+        values = {numeric(r.get("source", {}).get(source_field)) for r in rows} - {None}
+        result[name] = next(iter(values)) if len(values) == 1 else None
+    return result
+
+
 def chain_name(value):
     key = identity(value)
     aliases = {
@@ -56,8 +115,17 @@ def product_key(row):
 def line_view(row):
     raw = row.get("source", {})
     quantity = numeric(raw.get("quantity", row.get("units")))
-    unit = identity(raw.get("unit") or ("units" if quantity is not None else ""))
-    if unit in {"units", "unit", "un", "unidad", "unidades", "ud", "uds"}:
+    unit = identity(
+        raw.get("unit")
+        or (
+            "units"
+            if raw.get("total_units") is not None
+            or row.get("origin") == "operational"
+            and row.get("units") is not None
+            else ""
+        )
+    )
+    if unit in {"units", "unit", "un", "u", "und", "unidad", "unidades", "ud", "uds"}:
         unit = "unidades"
     elif unit in {"boxes", "cajas", "caja", "cj"}:
         unit = "cajas"
@@ -75,21 +143,44 @@ def line_view(row):
         quantity, unit = row["units"], "unidades"
     amount = numeric(raw.get("amount", row.get("amount")))
     price = numeric(raw.get("unit_price", row.get("unit_price")))
+    discount = numeric(raw.get("discount"))
     if amount is None and price is not None:
         original_qty = numeric(raw.get("quantity", row.get("units")))
         if original_qty is not None:
-            amount = original_qty * price
+            amount = original_qty * price - (discount or 0)
+    # The subtotal is net of discounts and uses the original unit. Once quantity
+    # has been converted to units, divide the net subtotal by that quantity.
+    net_price = amount / quantity if amount is not None and quantity else None
+    if row.get("monetary_issues"):
+        amount = net_price = None
     return dict(
         id=row["id"],
         key=product_key(row),
+        product_id=row.get("product_id"),
+        line=row.get("line", ""),
         name=row["product_name"],
         code=row.get("sku", ""),
         quantity=quantity,
         unit=unit,
         unit_price=price,
+        net_unit_price=net_price,
+        discount=discount,
         currency=str(raw.get("currency") or "").upper() or None,
         amount=amount,
         issues=row.get("issues", []),
+        comparison_issues=[
+            issue
+            for issue in row.get("issues", [])
+            if issue
+            not in {
+                "Fecha ausente o inválida",
+                "Fecha de OC pendiente",
+                "Fecha de factura pendiente",
+            }
+        ],
+        monetary_issues=row.get("monetary_issues", []),
+        identity_unresolved=not row.get("product_id")
+        and bool(row.get("catalog_issues")),
     )
 
 
@@ -98,10 +189,13 @@ def sum_known(values):
     return round(sum(values), 2) if all(v is not None for v in values) else None
 
 
-def build_workflow(evidence):
+def build_workflow(
+    evidence, start=None, end=None, chain=None, product_id=None, line=None, **_
+):
+    filter_line = line
     groups = defaultdict(list)
     for row in evidence:
-        if row.get("kind") not in {"order", "invoice"} or row.get("excluded"):
+        if row.get("kind") not in {"order", "invoice"}:
             continue
         number_ = (
             row.get("invoice_number")
@@ -128,6 +222,19 @@ def build_workflow(evidence):
             and len({reference(r.get("order_number")) for r in rows}) > 1
         ):
             problems.append("Referencias de OC contradictorias")
+        states = {administrative_state(r) for r in rows}
+        state = next(iter(states)) if len(states) == 1 else "review"
+        if len(states) > 1 or state == "review":
+            problems.append("Estado administrativo contradictorio o pendiente")
+        replacements = {
+            reference(r.get("source", {}).get("replaces") or r.get("replaces"))
+            for r in rows
+        } - {""}
+        replaced_by = {
+            reference(r.get("source", {}).get("replaced_by")) for r in rows
+        } - {""}
+        if len(replacements) > 1 or len(replaced_by) > 1:
+            problems.append("Referencias de reemplazo contradictorias")
         doc = dict(
             id=f"{document_id}:{kind}:{reference(canonical_chain)}:{reference(first.get('invoice_number') if kind == 'invoice' else first.get('order_number'))}",
             document_id=document_id,
@@ -142,7 +249,20 @@ def build_workflow(evidence):
             reference=first.get("order_number", "") if kind == "invoice" else "",
             lines=lines,
             issues=problems,
+            monetary_issues=list(
+                dict.fromkeys(i for r in rows for i in r.get("monetary_issues", []))
+            ),
             records=rows,
+            evidence_records=rows,
+            administrative_status=state,
+            excluded=state in {"cancelled", "replaced", "excluded"},
+            replaces=next(iter(replacements)) if len(replacements) == 1 else None,
+            replaced_by=next(iter(replaced_by)) if len(replaced_by) == 1 else None,
+            candidate_order_ids=[],
+            link_blocked=state == "review"
+            or len(replacements) > 1
+            or len(replaced_by) > 1
+            or any("contradictori" in identity(p) for p in problems),
             linked_order_id=None,
             link_method=None,
         )
@@ -153,6 +273,32 @@ def build_workflow(evidence):
         )
         currencies = {line["currency"] for line in lines}
         doc["currency"] = next(iter(currencies)) if len(currencies) == 1 else None
+        doc["financials"] = document_financials(rows, doc["currency"])
+        doc["references"] = sorted(
+            {
+                reference(value)
+                for r in rows
+                for value in [
+                    r.get("order_number"),
+                    r.get("source", {}).get("secondary_reference"),
+                    r.get("source", {}).get("order_reference"),
+                    r.get("source", {}).get("pedido_reference"),
+                    r.get("source", {}).get("purchase_order_reference"),
+                ]
+                if value
+            }
+        )
+        # Liris prints "OC_" as the document label; its invoice prints the same
+        # numeric reference without that label. Keep every leading zero.
+        liris_number = re.fullmatch(r"OC[_-](\d+)", str(doc["number"] or "").upper())
+        if kind == "order" and canonical_chain == "LIRIS DEL PORTAL" and liris_number:
+            doc["references"] = sorted(set(doc["references"]) | {liris_number.group(1)})
+        if kind == "invoice" and not doc["reference"]:
+            if len(doc["references"]) == 1:
+                doc["reference"] = doc["references"][0]
+            elif len(doc["references"]) > 1:
+                doc["link_blocked"] = True
+                append_issue(doc, "Referencias de OC contradictorias")
         doc["quantity_unit"] = lines[0]["unit"] if lines else ""
         totals = {numeric(r.get("source", {}).get("document_total")) for r in rows} - {
             None
@@ -172,6 +318,13 @@ def build_workflow(evidence):
             )
     removed = set()
     for copies in identities.values():
+        all_copies = list(copies)
+        selected = [d for d in copies if d["administrative_status"] != "excluded"]
+        if selected:
+            removed.update(
+                d["id"] for d in copies if d["administrative_status"] == "excluded"
+            )
+            copies = selected
         signatures = {
             repr(
                 (
@@ -179,6 +332,9 @@ def build_workflow(evidence):
                     d["reference"],
                     d["currency"],
                     d["amount"],
+                    d["administrative_status"],
+                    d["replaces"],
+                    d["replaced_by"],
                     sorted(
                         [
                             (
@@ -199,11 +355,28 @@ def build_workflow(evidence):
         # A business document occupies one position even when its versions conflict.
         copies.sort(key=lambda d: (d["origin"] != "operational", len(d["issues"])))
         representative = copies[0]
+        representative["evidence_records"] = [
+            r for d in all_copies for r in d["records"]
+        ]
+        representative["copies"] = [
+            dict(
+                id=d["id"],
+                document_id=d["document_id"],
+                filename=d["filename"],
+                administrative_status=d["administrative_status"],
+            )
+            for d in all_copies
+        ]
         removed.update(d["id"] for d in copies[1:])
         if len(signatures) > 1:
             representative["issues"].append(
                 "Existen versiones distintas del mismo número de documento"
             )
+            representative["link_blocked"] = True
+            # Conflicting copies never decide whether an invoice is active.
+            if len({d["administrative_status"] for d in copies}) > 1:
+                representative["administrative_status"] = "review"
+                representative["excluded"] = False
             representative["versions"] = [
                 dict(
                     id=d["id"],
@@ -217,19 +390,49 @@ def build_workflow(evidence):
                 for d in copies
             ]
     documents = [d for d in documents if d["id"] not in removed]
-    orders = [d for d in documents if d["kind"] == "order"]
+    orders = [d for d in documents if d["kind"] == "order" and not d["excluded"]]
     invoices = [d for d in documents if d["kind"] == "invoice"]
+    # A replacement number alone does not prove the original is invalid. Require
+    # an explicit cancelled/replaced original before including the replacement.
     for inv in invoices:
+        if inv["excluded"] or not inv["replaces"]:
+            continue
+        originals = [
+            old
+            for old in invoices
+            if old["chain"] == inv["chain"]
+            and reference(old["number"]) == inv["replaces"]
+        ]
+        if not originals or any(not old["excluded"] for old in originals):
+            for document in [inv, *originals]:
+                document["link_blocked"] = True
+                append_issue(
+                    document,
+                    "Reemplazo requiere evidencia del estado de la factura original",
+                )
+    for old in invoices:
+        if old["excluded"] and old["replaced_by"]:
+            replacements = [
+                inv
+                for inv in invoices
+                if inv["chain"] == old["chain"]
+                and reference(inv["number"]) == old["replaced_by"]
+            ]
+            for inv in replacements:
+                if inv["replaces"] and inv["replaces"] != reference(old["number"]):
+                    inv["link_blocked"] = True
+                    append_issue(inv, "Referencias de reemplazo contradictorias")
+    for inv in invoices:
+        if inv["excluded"]:
+            continue
         candidates = [
             o
             for o in orders
-            if o["chain"] == inv["chain"] and o["chain"] and not o["issues"]
+            if o["chain"] == inv["chain"] and o["chain"] and not o["link_blocked"]
         ]
         if inv["reference"]:
             candidates = [
-                o
-                for o in candidates
-                if reference(o["number"]) == reference(inv["reference"])
+                o for o in candidates if reference(inv["reference"]) in o["references"]
             ]
             method = "Número de OC explícito"
         else:
@@ -237,35 +440,56 @@ def build_workflow(evidence):
 
             def compatible(order):
                 if (
-                    not order["date"]
-                    or not inv["date"]
+                    not day(order["date"])
+                    or not day(inv["date"])
                     or not keys
+                    or any(item["comparison_issues"] for item in inv["lines"])
                     or not keys <= {line["key"] for line in order["lines"]}
                 ):
                     return False
-                return (
-                    0
-                    <= (
-                        date.fromisoformat(inv["date"])
-                        - date.fromisoformat(order["date"])
-                    ).days
-                    <= 90
-                )
+                return 0 <= (day(inv["date"]) - day(order["date"])).days <= 90
 
             candidates = [o for o in candidates if compatible(o)]
             method = "Cadena, productos exactos y fecha compatible"
-        if len(candidates) == 1 and not inv["issues"]:
+        inv["candidate_order_ids"] = [candidate["id"] for candidate in candidates]
+        if len(candidates) == 1 and not inv["link_blocked"]:
             inv["linked_order_id"] = candidates[0]["id"]
             inv["link_method"] = method
         else:
-            inv["issues"].append(
+            append_issue(
+                inv,
                 "Varias OC compatibles"
                 if len(candidates) > 1
-                else "OC pendiente de vincular"
+                else "OC pendiente de vincular",
             )
+    # Filter after linking all history: a second OC outside the selected period
+    # remains a real candidate and must not create a false unique match.
+    selected_orders = [
+        o
+        for o in orders
+        if (not chain or chain_name(chain) == o["chain"])
+        and (period_matches(o["date"], start, end) or not day(o["date"]))
+    ]
+    selected_ids = {o["id"] for o in selected_orders}
+    invoices = [
+        inv
+        for inv in invoices
+        if (not chain or chain_name(chain) == inv["chain"])
+        and (not end or not day(inv["date"]) or day(inv["date"]) <= day(end))
+        and (
+            inv["linked_order_id"] in selected_ids
+            or not inv["linked_order_id"]
+            and (period_matches(inv["date"], start, end) or not day(inv["date"]))
+        )
+    ]
+    orders = selected_orders
     comparisons = []
     for order in orders:
-        linked = [i for i in invoices if i["linked_order_id"] == order["id"]]
+        linked = [
+            i
+            for i in invoices
+            if not i["excluded"] and i["linked_order_id"] == order["id"]
+        ]
         order["invoices"] = [
             dict(
                 id=i["id"], number=i["number"], date=i["date"], method=i["link_method"]
@@ -288,22 +512,49 @@ def build_workflow(evidence):
             ordered = sum_known(line["quantity"] for line in ol)
             billed = sum_known(line["quantity"] for line in il)
             pending_invoice = any(
-                i["chain"] == order["chain"]
+                not i["excluded"]
+                and i["chain"] == order["chain"]
                 and not i["linked_order_id"]
                 and (
-                    not i["reference"]
-                    or reference(i["reference"]) == reference(order["number"])
+                    order["id"] in i["candidate_order_ids"]
+                    or reference(i["reference"]) in order["references"]
+                    or i["link_blocked"]
+                    and not i["reference"]
                 )
                 and key in {line["key"] for line in i["lines"]}
                 for i in invoices
             )
             uncertain = (
-                bool(order["issues"])
+                order["link_blocked"]
                 or pending_invoice
+                or any(item["comparison_issues"] for item in ol + il)
                 or not comparable
                 or ordered is None
                 or billed is None
+                or bool(linked)
+                and (
+                    bool(ol)
+                    and not il
+                    and any(item["identity_unresolved"] for item in ol)
+                    or bool(il)
+                    and not ol
+                    and any(item["identity_unresolved"] for item in order["lines"])
+                )
             )
+            if (
+                uncertain
+                and bool(linked)
+                and (
+                    any(item["identity_unresolved"] for item in ol)
+                    or il
+                    and not ol
+                    and any(item["identity_unresolved"] for item in order["lines"])
+                )
+            ):
+                append_issue(
+                    order,
+                    "Hay productos pendientes de equivalencia para el comparativo",
+                )
             status = (
                 "REVISAR"
                 if uncertain
@@ -328,8 +579,18 @@ def build_workflow(evidence):
             )
             # Missing quantity is valued at the OC price, never inferred from invoice totals.
             unbilled = (
-                max(diff, 0) * ordered_amount / ordered
+                0
+                if diff is not None and diff <= 0
+                else max(diff, 0) * ordered_amount / ordered
                 if diff is not None and ordered_amount is not None and ordered
+                else None
+            )
+            order_currencies = {line["currency"] for line in ol}
+            row_currency = (
+                next(iter(order_currencies))
+                if len(order_currencies) == 1
+                else order["currency"]
+                if not ol
                 else None
             )
             result_rows.append(
@@ -337,6 +598,9 @@ def build_workflow(evidence):
                     chain=order["chain"],
                     order_id=order["id"],
                     order_number=order["number"],
+                    product_id=sample["product_id"],
+                    line=sample["line"],
+                    key=key,
                     product=sample["name"],
                     code=sample["code"],
                     unit=sample["unit"],
@@ -349,18 +613,40 @@ def build_workflow(evidence):
                     else None,
                     ordered_amount=ordered_amount,
                     invoiced_amount=billed_amount,
-                    currency=order["currency"],
+                    currency=row_currency,
                     invoiced_currency=next(iter({line["currency"] for line in il}))
                     if len({line["currency"] for line in il}) == 1
-                    else order["currency"]
+                    else row_currency
                     if not il
                     else None,
                     unbilled_amount=round(unbilled, 2)
                     if unbilled is not None
                     else None,
                     status=status,
+                    order_records=[
+                        r for r in order["records"] if product_key(r) == key
+                    ],
+                    invoices=[
+                        r for i in linked for r in i["records"] if product_key(r) == key
+                    ],
+                    pending_records=[
+                        r
+                        for i in invoices
+                        if not i["excluded"]
+                        and not i["linked_order_id"]
+                        and order["id"] in i["candidate_order_ids"]
+                        for r in i["records"]
+                        if product_key(r) == key
+                    ],
                 )
             )
+        if product_id or filter_line:
+            result_rows = [
+                r
+                for r in result_rows
+                if (not product_id or r["product_id"] == product_id)
+                and (not filter_line or r["line"] == filter_line)
+            ]
         comparisons.extend(result_rows)
         order["fulfillment"] = (
             round(
@@ -370,6 +656,7 @@ def build_workflow(evidence):
                 2,
             )
             if result_rows
+            and len({r["unit"] for r in result_rows}) == 1
             and all(r["status"] != "REVISAR" for r in result_rows)
             and sum(r["ordered"] for r in result_rows)
             else None
@@ -386,12 +673,21 @@ def build_workflow(evidence):
             else "NO FACTURADO"
         )
     for invoice in invoices:
-        invoice["status"] = "OK" if invoice["linked_order_id"] else "REVISAR"
+        invoice["status"] = (
+            "OK"
+            if invoice["excluded"]
+            or invoice["linked_order_id"]
+            and not invoice["issues"]
+            and not invoice["monetary_issues"]
+            else "REVISAR"
+        )
     chains = []
-    for chain in sorted({d["chain"] for d in documents}):
+    for chain in sorted({d["chain"] for d in orders + invoices}):
         chain_orders = [d for d in orders if d["chain"] == chain]
-        chain_invoices = [d for d in invoices if d["chain"] == chain]
-        pending = sum(not i["linked_order_id"] for i in chain_invoices)
+        chain_invoices = [
+            d for d in invoices if d["chain"] == chain and not d["excluded"]
+        ]
+        pending = sum(i["status"] == "REVISAR" for i in chain_invoices)
         chains.append(
             dict(
                 chain=chain or "Sin identificar",
@@ -417,14 +713,19 @@ def build_workflow(evidence):
         comparisons=comparisons,
         chains=chains,
         summary=dict(
-            invoices=len(invoices),
-            linked=sum(bool(i["linked_order_id"]) for i in invoices),
-            pending=sum(not i["linked_order_id"] for i in invoices),
+            invoices=sum(not i["excluded"] for i in invoices),
+            linked=sum(
+                bool(i["linked_order_id"]) for i in invoices if not i["excluded"]
+            ),
+            pending=sum(
+                i["status"] == "REVISAR" for i in invoices if not i["excluded"]
+            ),
+            excluded_invoices=sum(i["excluded"] for i in invoices),
         ),
     )
 
 
-def saved_workflow(db):
+def saved_evidence(db):
     from app.modules.commercial.service import records
     from app.modules.commercial.processing import processing_records
 
@@ -435,13 +736,39 @@ def saved_workflow(db):
         if row["id"] in recognition:
             normalized_units = row["units"]
             normalized_name = row["product_name"]
+            monetary_issues = row.get("monetary_issues", [])
             recognized = recognition[row["id"]]
+            catalog_issues = [
+                issue
+                for issue in row.get("issues", [])
+                if issue not in recognized["issues"]
+            ]
+            blocking_catalog_issues = [
+                issue
+                for issue in catalog_issues
+                if any(
+                    word in identity(issue)
+                    for word in (
+                        "contrad",
+                        "conflic",
+                        "difier",
+                        "conversion",
+                        "inconsistente",
+                        "ambiguo",
+                    )
+                )
+            ]
             # Catalog uncertainty does not invalidate a readable source document.
             row = {
                 **row,
                 **recognized,
                 "product_id": row["product_id"],
                 "excluded": row["excluded"],
+                "monetary_issues": monetary_issues,
+                "catalog_issues": catalog_issues,
+                "issues": list(
+                    dict.fromkeys([*recognized["issues"], *blocking_catalog_issues])
+                ),
             }
             if row["product_id"]:
                 row["units"] = normalized_units
@@ -453,4 +780,8 @@ def saved_workflow(db):
                         if i != "Descripción del producto pendiente"
                     ]
         evidence.append(row)
-    return build_workflow(evidence)
+    return evidence
+
+
+def saved_workflow(db, **filters):
+    return build_workflow(saved_evidence(db), **filters)

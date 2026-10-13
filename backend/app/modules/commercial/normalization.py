@@ -82,7 +82,7 @@ def number(value) -> Decimal | None:
 def parse_date(value) -> str | None:
     if isinstance(value, (date, datetime)):
         return value.strftime("%Y-%m-%d")
-    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d"):
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d", "%d/%m/%y", "%d-%m-%y"):
         try:
             return datetime.strptime(str(value or "").strip(), fmt).date().isoformat()
         except ValueError:
@@ -153,6 +153,11 @@ HEADERS = {
         "amount",
     ],
     "document_total": ["total documento", "total factura"],
+    "document_subtotal": ["subtotal documento", "subtotal sin impuestos"],
+    "document_discount": ["descuento documento", "descuento total"],
+    "document_tax": ["iva documento", "iva total"],
+    "discount": ["descuento", "descuento linea", "descuento importe"],
+    "discount_percent": ["descuento %", "% descuento", "porcentaje descuento"],
     "currency": ["moneda", "currency"],
     "status": ["estado", "status"],
     "replaces": ["reemplaza", "factura reemplazada", "replaces"],
@@ -184,6 +189,9 @@ def resolve_product(raw, products, profiles, aliases):
         ), "selección revisada"
     candidates = set()
     evidence = []
+    from app.modules.purchase_orders.domain.customer_profiles import aliases_for_chain
+
+    configured_aliases = aliases_for_chain(str(raw.get("chain") or ""))
     for field in ("ean", "code"):
         code = str(raw.get(field) or "").strip()
         if not code:
@@ -206,6 +214,12 @@ def resolve_product(raw, products, profiles, aliases):
                 if identity(a.chain_name) == identity(raw.get("chain"))
                 and a.detected_code == code
             }
+            matches.update(
+                str(p.id)
+                for a in configured_aliases
+                for p in products
+                if a["detected_code"] == code and a["sku"] == p.sku
+            )
         if field == "ean" and not matches:
             return None, "EAN no reconocido; requiere confirmación"
         if matches:
@@ -242,7 +256,7 @@ def resolve_product(raw, products, profiles, aliases):
 
 
 def normalize(raw, products, profiles, aliases):
-    issues = []
+    issues = list(raw.get("document_issues") or [])
     monetary_issues = []
 
     def numeric(field, monetary=False):
@@ -327,6 +341,12 @@ def normalize(raw, products, profiles, aliases):
         issues.append("Cantidad comparable ausente o inválida")
     price = numeric("unit_price", True)
     amount = numeric("amount", True)
+    discount = numeric("discount", True)
+    discount_percent = numeric("discount_percent", True)
+    if discount is not None and discount < 0:
+        monetary_issues.append("Descuento de línea negativo")
+    if discount_percent is not None and not 0 <= discount_percent <= 100:
+        monetary_issues.append("Porcentaje de descuento fuera de rango")
     if (
         price is not None
         and not unit
@@ -346,19 +366,40 @@ def normalize(raw, products, profiles, aliases):
         "DOLARES",
     ):
         monetary_issues.append("Moneda no confirmada como USD")
+    if identity(raw.get("price_unit")) in {"units", "unidades"}:
+        price_divisor = Decimal(1)
     normalized_price = price / price_divisor if price is not None else None
     calculated = (
         units * normalized_price
         if units is not None and normalized_price is not None
         else None
     )
+    if calculated is not None:
+        percentage_discount = (
+            calculated * discount_percent / 100
+            if discount_percent is not None
+            else None
+        )
+        if (
+            discount is not None
+            and percentage_discount is not None
+            and abs(discount - percentage_discount) > Decimal("0.02")
+        ):
+            monetary_issues.append("Importe y porcentaje de descuento no coinciden")
+        line_discount = discount if discount is not None else percentage_discount
+        if line_discount is not None:
+            calculated -= line_discount
+            if calculated < 0:
+                monetary_issues.append("Descuento de línea supera el importe bruto")
+            elif units:
+                normalized_price = calculated / units
     if (
         amount is not None
         and calculated is not None
         and abs(amount - calculated) > Decimal("0.02")
     ):
         monetary_issues.append(
-            "Subtotal difiere de cantidad × precio; revisar descuento, impuesto o base del precio"
+            "Subtotal difiere de cantidad × precio menos descuento; revisar impuesto o base del precio"
         )
     if amount is None:
         amount = calculated

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { DocumentWorkspace } from "./DocumentWorkspace";
+import { DocumentDialog, DocumentWorkspace } from "./DocumentWorkspace";
 import { groupDocuments } from "./documentReview";
 import type { Evidence } from "./types";
 const row: Evidence = { id: "r1", document_id: "d1", filename: "OC.pdf", origin: "import", chain: "", kind: "order", date: "2026-09-08", order_number: "OC-100", invoice_number: "", product_id: "p1", product_name: "Shampoo", sku: "SH1", units: 8, amount: null, conversion: "", match_method: "EAN", source_location: "Página 1", source_url: "/source", issues: ["Cadena no identificada"], monetary_issues: [], excluded: false, source: {}, revision: 1 };
@@ -42,4 +42,17 @@ it("un documento correcto se abre sin pedir confirmación", async () => {
     fireEvent.click(await screen.findByRole("button", { name: "Ver OC.pdf" }));
     expect(screen.getByText("OK · No necesitas confirmar ningún dato.")).toBeVisible();
     expect(screen.queryByRole("button", { name: "Aplicar a todo el documento" })).not.toBeInTheDocument();
+});
+it("resuelve un estado administrativo dudoso una sola vez para toda la factura", async () => {
+    const refresh = vi.fn(async () => {});
+    const records = rows.map(r => ({...r, kind: "invoice", issues: [], chain: "TIA", invoice_number: "001-001-000000001"}));
+    render(<DocumentDialog document={{id: "d1", filename: "Factura.pdf", records, issues: ["Estado administrativo contradictorio o pendiente"], status: "REVISAR"}} products={[]} onClose={() => {}} onSaved={refresh} />);
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getAllByText("Estado administrativo contradictorio o pendiente")).toHaveLength(1);
+    expect(within(dialog).getByText("1 problema")).toBeVisible();
+    fireEvent.change(within(dialog).getByLabelText("Estado administrativo"), {target: {value: "anulada"}});
+    fireEvent.click(within(dialog).getByRole("button", {name: "Aplicar a todo el documento"}));
+    await waitFor(() => expect(refresh).toHaveBeenCalled());
+    const call = vi.mocked(fetch).mock.calls.find(([, options]) => options?.method === "PATCH");
+    expect(JSON.parse(String(call?.[1]?.body))).toMatchObject({values: {status: "anulada"}, revisions: {r1: 1, r2: 1}});
 });

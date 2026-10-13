@@ -546,7 +546,10 @@ def test_duplicate_copy_can_be_resolved_for_whole_document_without_deleting(clie
     copy_id = imported[1]["document_id"]
     data = http.get("/api/v1/commercial/dashboard").json()
     copy_rows = [r for r in data["records"] if r["document_id"] == copy_id]
-    assert any("duplicado" in issue for r in copy_rows for issue in r["issues"])
+    # Identical business details consolidate automatically; retain both originals.
+    assert len(copy_rows) == 1
+    assert data["summary"]["ordered"] == 24
+    assert not any(r["issues"] for r in copy_rows)
     result = http.patch(
         f"/api/v1/commercial/documents/{copy_id}/header",
         json={
@@ -577,7 +580,7 @@ def test_recognition_is_independent_from_catalog_and_financial_valuation(client)
     assert any(
         "sin equivalencia" in issue
         for issue in http.get("/api/v1/commercial/dashboard").json()["records"][0][
-            "issues"
+            "catalog_issues"
         ]
     )
 

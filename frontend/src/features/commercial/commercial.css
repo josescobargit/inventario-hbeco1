@@ -97,6 +97,24 @@
   flex-wrap:wrap;
   margin-bottom:24px
 }
+.commercial-period {
+  background:#f2f7f7;
+  border:1px solid var(--commercial-border);
+  border-radius:10px;
+  padding:12px 16px
+}
+.commercial-weekly-report .commercial-ranking small {
+  display:block;
+  font-weight:400;
+  color:#637b83;
+  margin-top:5px
+}
+.workflow-financials {
+  border-top:1px solid var(--commercial-border);
+  border-bottom:1px solid var(--commercial-border);
+  padding:8px 0;
+  margin:16px 0
+}
 .commercial-center label {
   display:flex;
   flex-direction:column;

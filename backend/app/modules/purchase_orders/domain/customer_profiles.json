@@ -8,6 +8,33 @@
         {"code": "168929000", "sku": "AR003"},
         {"code": "168933000", "sku": "AR001"}
       ]
+    },
+    {
+      "chain_names": ["TUTI", "TIENDAS TUTI", "TIENDAS TUTI TTDE S.A."],
+      "evidence": {
+        "order_number": "4500360076",
+        "invoice_numbers": ["001-001-000000915", "001-001-000000916"],
+        "basis": "Marca, tipo y contenido de cada descripción cotejados con los SKU de las facturas; cantidades no usadas para identificar productos"
+      },
+      "product_aliases": [
+        {"code": "40004233", "sku": "AE015"},
+        {"code": "40004234", "sku": "AE016"},
+        {"code": "40004238", "sku": "AE002"}
+      ]
+    },
+    {
+      "chain_names": ["INDUSTRIAL DANEC", "INDUSTRIAL DANEC S A", "INDUSTRIAL DANEC S.A."],
+      "evidence": {
+        "order_number": "26003023",
+        "invoice_number": "001-001-000001016",
+        "basis": "Descripción, presentación y código de producto verificados en los documentos originales"
+      },
+      "product_aliases": [
+        {"code": "1283410280001", "sku": "AR001", "description": "ANA REGEN SHAM BOT400ML 12U"},
+        {"code": "1283410280002", "sku": "AR002", "description": "ANA REGEN ACON BOT400ML 12U"},
+        {"code": "1283410280003", "sku": "AE003", "description": "ANA ELIXIR SHA+ACO BOT740ML 6U"},
+        {"code": "1283410280004", "sku": "AR004", "description": "ANA CREMA PEINAR BOT200ML 12U"}
+      ]
     }
   ]
 }

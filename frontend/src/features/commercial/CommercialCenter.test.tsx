@@ -4,11 +4,12 @@ import { CommercialCenter } from "./CommercialCenter";
 const totals = { ordered: 24, invoiced: 12, missing: 12, difference: 12, fulfillment: 50, ordered_amount: null, invoiced_amount: 24, unbilled_amount: null };
 const record = { id: "row1", document_id: "doc1", filename: "pedido.csv", source_location: "CSV, fila 2", source_url: "/commercial/documents/doc1/content", origin: "import", kind: "order", chain: "Cadena A", date: "2026-10-01", product_id: "p1", product_name: "Shampoo Romero", sku: "SH001", units: 24, amount: null, conversion: "2 cajas × 12 = 24 unidades", match_method: "EAN exacto", order_number: "OC-1", invoice_number: "", issues: ["Moneda por revisar"], monetary_issues: [], excluded: false, source: { kind: "OC", chain: "Cadena A" }, revision: 1 };
 const fixture = { summary: { ...totals, review_records: 1, excluded_records: 0, sell_in_units: null, sell_out_units: null }, rows: [{ ...totals, chain: "Cadena A", product_name: "Shampoo Romero", sku: "SH001", order_number: "OC-1", status: "PARCIAL", order_records: [record], invoices: [], pending_records: [] }], chains: [{ ...totals, chain: "Cadena A" }], products: [], by_chain_product: [], records: [record], alerts: [{ level: "REVISIÓN", code: "valuation", message: "Moneda por revisar", record_ids: ["row1"] }], sales: [], sell_comparison: [], sales_by_line: [], sales_movements: [], evolution: [], rankings: {}, basis: "Cifras confirmadas; los datos dudosos no se suman.", executive_report: ["Quedaron 12 unidades pendientes."] };
+const weekly = { period: {date_from: "2026-10-01", date_to: "2026-10-07", basis: "OC del período y sus facturas vinculadas"}, summary: totals, chains: fixture.chains, critical_products: {missing: fixture.rows, not_invoiced: [], economic: []}, alerts: fixture.alerts, counts: {orders: 1, invoices: 1, linked: 1, pending: 0, review_documents: 1, excluded_invoices: 0}};
 beforeEach(() => {
     HTMLDialogElement.prototype.showModal = function () { this.setAttribute("open", ""); };
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, options?: RequestInit) => {
         const path = String(input);
-        const payload = path.includes("/commercial/dashboard") ? fixture : path.includes("/commercial/products") ? [] : path.includes("/commercial/imports") ? { files: [{ filename: "ventas.csv", status: "processed", message: "Procesado", rows: 1 }] } : path.includes("/commercial/assistant") ? { answer: ["Quedaron 12 unidades pendientes."], mode: "local", filters: {}, sources: [], limitations: "Solo datos almacenados." } : options?.method === "PATCH" ? { revision: 2 } : {};
+        const payload = path.includes("/commercial/dashboard") ? fixture : path.includes("/commercial/weekly-report") ? weekly : path.includes("/commercial/products") ? [] : path.includes("/commercial/imports") ? { files: [{ filename: "ventas.csv", status: "processed", message: "Procesado", rows: 1 }] } : path.includes("/commercial/assistant") ? { answer: ["Quedaron 12 unidades pendientes."], mode: "local", filters: {}, sources: [], limitations: "Solo datos almacenados." } : options?.method === "PATCH" ? { revision: 2 } : {};
         return new Response(JSON.stringify(payload), { status: 200, headers: { "Content-Type": "application/json" } });
     }));
 });
@@ -17,7 +18,7 @@ describe("Control comercial", () => {
     it("distingue importes desconocidos y permite auditar el cálculo", async () => {
         render(<CommercialCenter />);
         fireEvent.click(screen.getByRole("button", { name: "Más opciones" }));
-        expect(await screen.findByText("1 registros necesitan revisión.")).toBeVisible();
+        expect(await screen.findByText("1 documento necesita revisión.")).toBeVisible();
         expect(screen.getAllByText("Sin dato").length).toBeGreaterThan(0);
         fireEvent.click(screen.getByRole("button", { name: "OC vs facturas" }));
         fireEvent.click(screen.getByText("OC → facturas"));
@@ -46,10 +47,10 @@ describe("Control comercial", () => {
     it("envía filtros al asistente y a las exportaciones", async () => {
         render(<CommercialCenter />);
         fireEvent.click(screen.getByRole("button", { name: "Más opciones" }));
-        await screen.findByText("1 registros necesitan revisión.");
+        await screen.findByText("1 documento necesita revisión.");
         fireEvent.change(screen.getByLabelText("Cadena"), { target: { value: "Cadena A" } });
         fireEvent.click(screen.getByRole("button", { name: "Aplicar filtros" }));
-        await screen.findByText("1 registros necesitan revisión.");
+        await screen.findByText("1 documento necesita revisión.");
         fireEvent.click(screen.getByRole("button", { name: "Asistente" }));
         fireEvent.click(screen.getByRole("button", { name: "Dime qué debería revisar" }));
         expect(await screen.findByText("Quedaron 12 unidades pendientes.")).toBeVisible();
@@ -60,11 +61,31 @@ describe("Control comercial", () => {
     it("muestra el error de carga sin reutilizar indicadores anteriores", async () => {
         render(<CommercialCenter />);
         fireEvent.click(screen.getByRole("button", { name: "Más opciones" }));
-        await screen.findByText("1 registros necesitan revisión.");
+        await screen.findByText("1 documento necesita revisión.");
         vi.mocked(fetch).mockImplementation(async () => new Response(JSON.stringify({ detail: "Base temporalmente no disponible" }), { status: 503 }));
         fireEvent.click(screen.getByRole("button", { name: "Aplicar filtros" }));
         expect(await screen.findByRole("alert")).toHaveTextContent("Base temporalmente no disponible");
-        expect(screen.queryByText("1 registros necesitan revisión.")).not.toBeInTheDocument();
+        expect(screen.queryByText("1 documento necesita revisión.")).not.toBeInTheDocument();
         expect(within(screen.getByRole("alert")).getByRole("button", { name: "Reintentar" })).toBeVisible();
+    });
+    it("genera el reporte con el período aplicado y exporta ese mismo período sin recargar archivos", async () => {
+        render(<CommercialCenter />);
+        await screen.findByText("Pedido total");
+        expect(screen.queryByRole("button", {name: "Maestro"})).not.toBeInTheDocument();
+        fireEvent.change(screen.getByLabelText("Desde"), {target: {value: "2026-10-01"}});
+        fireEvent.change(screen.getByLabelText("Hasta"), {target: {value: "2026-10-07"}});
+        fireEvent.click(screen.getByRole("button", {name: "Aplicar período"}));
+        await screen.findByText("Pedido total");
+        fireEvent.click(screen.getByRole("button", {name: "GENERAR REPORTE SEMANAL"}));
+        const report = await screen.findByLabelText("Reporte semanal generado");
+        expect(within(report).getByRole("heading", {name: "Resumen general"})).toBeVisible();
+        expect(within(report).getByRole("table", {name: "Reporte semanal por cadena"})).toBeVisible();
+        expect(within(report).getByRole("heading", {name: "Principales productos faltantes"})).toBeVisible();
+        expect(within(report).getByRole("heading", {name: "Productos no facturados"})).toBeVisible();
+        expect(within(report).getByRole("heading", {name: "Mayor dinero no facturado"})).toBeVisible();
+        expect(within(report).getAllByText("Pendiente").length).toBeGreaterThan(0);
+        expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).includes("/weekly-report?") && String(url).includes("date_from=2026-10-01") && String(url).includes("date_to=2026-10-07"))).toBe(true);
+        expect(screen.getByRole("link", {name: "Descargar PDF gerencial"})).toHaveAttribute("href", expect.stringContaining("date_to=2026-10-07"));
+        expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).includes("/imports"))).toBe(false);
     });
 });

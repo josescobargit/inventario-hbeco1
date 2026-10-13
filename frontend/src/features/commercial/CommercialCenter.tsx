@@ -1,9 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { apiRequest, apiUrl } from "../../api/client";
-import type { Alert, CommercialData, CommercialProduct, ComparisonRow, Evidence, Filters } from "./types";
+import type { Alert, CommercialData, CommercialProduct, ComparisonRow, Evidence, Filters, Totals, WeeklyReport } from "./types";
+import { DocumentDialog } from "./DocumentWorkspace";
+import { groupDocuments } from "./documentReview";
 import "./commercial.css";
 const n = (v: number | null | undefined) => v == null ? "Sin dato" : new Intl.NumberFormat("es-EC", { maximumFractionDigits: 2 }).format(v);
 const usd = (v: number | null | undefined) => v == null ? "Sin dato" : new Intl.NumberFormat("es-EC", { style: "currency", currency: "USD" }).format(v);
+const money = (v: number | null | undefined, currency?: string | null) => v == null ? "Pendiente" : currency && /^[A-Z]{3}$/.test(currency) ? new Intl.NumberFormat("es-EC", { style: "currency", currency }).format(v) : `${n(v)} · moneda pendiente`;
+const displayDate = (v: string | null | undefined) => v ? v.split("-").reverse().join("/") : "Sin fecha";
 const labels: Record<string, string> = { order: "Pedido", invoice: "Facturado", sell_in: "Sell In", sell_out: "Sell Out", ordered: "Unidades pedidas", invoiced: "Unidades facturadas", missing: "Unidades faltantes", ordered_amount: "Dinero pedido", invoiced_amount: "Dinero facturado", unbilled_amount: "Dinero no facturado", sell_in_units: "Sell In", sell_out_units: "Sell Out" };
 const tabs = ["Resumen", "OC vs facturas", "Por cadena", "Sell In / Sell Out", "Histórico", "Maestro", "Asistente", "Reporte"] as const;
 type Tab = typeof tabs[number];
@@ -13,13 +17,18 @@ function bodyFilters(filters: Filters) { return Object.fromEntries(Object.entrie
 export function CommercialCenter({ initialTab = "Resumen" }: { initialTab?: Tab } = {}) {
     const [advanced, setAdvanced] = useState(false);
     const [tab, setTab] = useState<Tab>(initialTab);
-    const [filters, setFilters] = useState(initialFilters);
-    const [draftFilters, setDraftFilters] = useState(initialFilters);
+    const [filters, setFilters] = useState(() => { try { const saved = JSON.parse(sessionStorage.getItem("commercial.dashboardFilters") || "{}") as Record<string, unknown>; return { ...initialFilters, ...Object.fromEntries(["chain", "date_from", "date_to"].filter(key => typeof saved[key] === "string").map(key => [key, saved[key]])) }; } catch { return initialFilters; } });
+    const [draftFilters, setDraftFilters] = useState(filters);
     const [data, setData] = useState<CommercialData | null>(null);
     const [products, setProducts] = useState<CommercialProduct[]>([]);
     const [error, setError] = useState("");
     const [loading, setLoading] = useState(true);
     const [selected, setSelected] = useState<Evidence | null>(null);
+    const [reviewDocument, setReviewDocument] = useState<string | null>(null);
+    const [weekly, setWeekly] = useState<WeeklyReport | null>(null);
+    const [reportLoading, setReportLoading] = useState(false);
+    const [reportError, setReportError] = useState("");
+    const reportGeneration = useRef(0);
     const generation = useRef(0);
     const refresh = useCallback(async (signal?: AbortSignal) => {
         const request = ++generation.current;
@@ -48,30 +57,43 @@ export function CommercialCenter({ initialTab = "Resumen" }: { initialTab?: Tab 
         const timer = window.setTimeout(() => void refresh(controller.signal), 0);
         return () => { window.clearTimeout(timer); controller.abort(); };
     }, [refresh]);
-    function openAlert(alert: Alert) { const record = data?.records.find(r => alert.record_ids.includes(r.id)); if (record)
-        setSelected(record); }
+    function openAlert(alert: Alert) { const record = data?.records.find(r => alert.record_ids.includes(r.id)); if (alert.code === "invoice_without_order") { if (record) sessionStorage.setItem("commercial.open.invoices", `${record.document_id}:invoice:${record.chain.replace(/[^A-Z0-9]/g, "")}:${record.invoice_number.replace(/[^A-Z0-9]/g, "")}`); window.dispatchEvent(new CustomEvent("inventario:navigate", { detail: "invoices" })); } else if (record) setReviewDocument(record.document_id); else window.dispatchEvent(new CustomEvent("inventario:navigate", { detail: "invoices" })); }
+    const currentReview = groupDocuments(data?.records ?? [], []).find(d => d.id === reviewDocument);
+    const reviewCount = data?.summary.review_documents ?? groupDocuments(data?.records ?? [], []).filter(d => d.status === "REVISAR").length;
+    function applyFilters(next: Filters) { setFilters(next); setWeekly(null); setReportError(""); setReportLoading(false); reportGeneration.current += 1; }
+    async function generateWeekly() {
+        const request = ++reportGeneration.current;
+        setTab("Reporte"); setReportLoading(true); setReportError(""); setWeekly(null);
+        try { const report = await apiRequest<WeeklyReport>(`/commercial/weekly-report?${params(filters)}`); if (request === reportGeneration.current) setWeekly(report); }
+        catch (e) { if (request === reportGeneration.current) setReportError(e instanceof Error ? e.message : "No se pudo generar el reporte semanal"); }
+        finally { if (request === reportGeneration.current) setReportLoading(false); }
+    }
     return <section className="commercial-center">
-    <header className="commercial-header"><div><span className="commercial-eyebrow">GERENCIA COMERCIAL</span><h1>{initialTab === "Sell In / Sell Out" ? "Sell In / Sell Out" : "Dashboard comercial"}</h1><p>Indicadores, cumplimiento y oportunidades por cadena.</p></div><div className="commercial-actions"><button className="commercial-primary" onClick={() => window.dispatchEvent(new CustomEvent("inventario:navigate", { detail: "processing" }))}>Procesar documentos</button><button aria-expanded={advanced} onClick={() => setAdvanced(!advanced)}>Más opciones</button></div></header>
-    <nav className="commercial-tabs" aria-label="Control comercial">{tabs.filter(t => !["Histórico", "Maestro"].includes(t)).map(t => <button key={t} aria-label={t} onClick={() => setTab(t)} aria-current={tab === t ? "page" : undefined}>{t}</button>)}</nav>
-    {advanced && <><div className="commercial-actions">{(["Histórico", "Maestro"] as const).map(t => <button key={t} onClick={() => setTab(t)}>{t}</button>)}</div>
-    <form className="commercial-filters" onSubmit={e => { e.preventDefault(); setFilters({ ...draftFilters }); }}>
+    <header className="commercial-header"><div><span className="commercial-eyebrow">OC → FACTURA → COMPARATIVO → RESULTADOS</span><h1>{initialTab === "Sell In / Sell Out" ? "Sell In / Sell Out" : "Dashboard comercial"}</h1><p>Resultados de las OC y facturas guardadas, organizados por cadena.</p></div><div className="commercial-actions"><button className="commercial-primary" onClick={() => window.dispatchEvent(new CustomEvent("inventario:navigate", { detail: "processing" }))}>Procesar documentos</button><button aria-expanded={advanced} onClick={() => setAdvanced(!advanced)}>Más opciones</button></div></header>
+    <nav className="commercial-tabs" aria-label="Control comercial">{(["Resumen", "Sell In / Sell Out", "Reporte"] as const).map(t => <button key={t} aria-label={t} onClick={() => setTab(t)} aria-current={tab === t ? "page" : undefined}>{t}</button>)}</nav>
+    <form className="commercial-filters commercial-period" onSubmit={e => { e.preventDefault(); applyFilters({ ...draftFilters }); }}>
       <label>Desde<input type="date" value={draftFilters.date_from} onChange={e => setDraftFilters({ ...draftFilters, date_from: e.target.value })}/></label>
       <label>Hasta<input type="date" value={draftFilters.date_to} min={draftFilters.date_from} onChange={e => setDraftFilters({ ...draftFilters, date_to: e.target.value })}/></label>
+      <button disabled={loading}>Aplicar período</button><button type="button" disabled={loading} onClick={() => { applyFilters({ ...filters, date_from: "", date_to: "" }); setDraftFilters({ ...draftFilters, date_from: "", date_to: "" }); }}>Todo el período</button>
+    </form>
+    {advanced && <><div className="commercial-actions">{tabs.filter(t => !["Resumen", "Sell In / Sell Out", "Reporte"].includes(t)).map(t => <button key={t} onClick={() => setTab(t)}>{t}</button>)}</div>
+    <form className="commercial-filters" onSubmit={e => { e.preventDefault(); applyFilters({ ...draftFilters }); }}>
       <label>Cadena<input placeholder="Todas las cadenas" value={draftFilters.chain} onChange={e => setDraftFilters({ ...draftFilters, chain: e.target.value })}/></label>
       <label>Producto<select value={draftFilters.product_id} onChange={e => setDraftFilters({ ...draftFilters, product_id: e.target.value })}><option value="">Todos los productos</option>{products.map(p => <option value={p.id} key={p.id}>{p.name}</option>)}</select></label>
       <label>Línea<input placeholder="Todas las líneas" value={draftFilters.line} onChange={e => setDraftFilters({ ...draftFilters, line: e.target.value })}/></label>
       <label>Objetivo %<input type="number" min="0" max="100" step="0.1" required value={draftFilters.target} onChange={e => setDraftFilters({ ...draftFilters, target: e.target.value })}/></label>
       <label>Alerta económica USD<input type="number" min="0" step="0.01" required value={draftFilters.economic_threshold} onChange={e => setDraftFilters({ ...draftFilters, economic_threshold: e.target.value })}/></label>
-      <button disabled={loading}>Aplicar filtros</button><button type="button" disabled={loading} onClick={() => { setFilters(initialFilters); setDraftFilters(initialFilters); }}>Ver histórico completo</button>
+      <button disabled={loading}>Aplicar filtros</button><button type="button" disabled={loading} onClick={() => { applyFilters(initialFilters); setDraftFilters(initialFilters); }}>Ver histórico completo</button>
     </form></>}
     {error && <p role="alert" className="commercial-error">{error} <button onClick={() => void refresh()}>Reintentar</button></p>}
     {loading && <p role="status">Consultando documentos y recalculando resultados…</p>}
     {!loading && data?.summary && <>
       {tab === "Resumen" && <>
-        <div className="commercial-kpis">{[["Pedido total", usd(data.summary.ordered_amount)], ["Facturado de estas OC", usd(data.summary.invoiced_amount)], ["Dinero no facturado", usd(data.summary.unbilled_amount)], ["Cumplimiento", data.summary.fulfillment == null ? "Sin dato" : `${n(data.summary.fulfillment)}%`], ["Unidades pedidas", n(data.summary.ordered)], ["Unidades facturadas", n(data.summary.invoiced)], ["Unidades faltantes", n(data.summary.missing)], ["Sell In / Sell Out", `${n(data.summary.sell_in_units)} / ${n(data.summary.sell_out_units)}`]].map(([label, value]) => <article key={label}><span>{label}</span><strong>{value}</strong></article>)}</div>
-        {data.summary.review_records > 0 && <div className="commercial-notice"><strong>{data.summary.review_records} registros necesitan revisión.</strong> Los totales solo incluyen cantidades verificables. <button onClick={() => setTab("OC vs facturas")}>Revisar cruce comercial</button></div>}
-        <div className="commercial-grid"><BarChart title="Pedido vs facturado por cadena" items={data.chains.map(c => ({ label: c.chain, value: c.ordered, secondary: c.invoiced }))}/><BarChart title="Dinero pendiente por cadena · USD" items={data.chains.map(c => ({ label: c.chain, value: c.unbilled_amount }))}/><BarChart title="Cumplimiento por cadena · %" items={data.chains.map(c => ({ label: c.chain, value: c.fulfillment }))}/><BarChart title="Unidades faltantes por cadena" items={data.chains.map(c => ({ label: c.chain, value: c.missing }))}/></div>
-        <div className="commercial-grid">{Object.entries(data.rankings).map(([key, rows]) => <article className="commercial-panel" key={key}><h2>{{ chains_billed: "Cadenas con mayor facturación", chains_low_fulfillment: "Menor cumplimiento", chains_missing: "Mayor faltante por cadena", products_ordered: "Productos más pedidos", products_billed: "Productos más facturados", products_missing: "Productos con mayor faltante", products_impact: "Impacto económico por producto" }[key] ?? key}</h2>{rows.length ? <ol className="commercial-ranking">{rows.map((r, i) => <li key={i}><span>{r.chain || r.product_name}</span><strong>{key.includes("impact") ? usd(r.unbilled_amount) : key === "chains_billed" ? usd(r.invoiced_amount) : key.includes("fulfillment") ? `${n(r.fulfillment)}%` : key.includes("ordered") ? n(r.ordered) : key === "products_billed" ? n(r.invoiced) : n(r.missing)}</strong></li>)}</ol> : <Empty />}</article>)}</div>
+        <div className="commercial-section-heading"><p>Período: {filters.date_from || filters.date_to ? `${displayDate(filters.date_from)} → ${displayDate(filters.date_to)}` : "Todos los documentos guardados"}</p><button className="commercial-primary" disabled={reportLoading} onClick={() => void generateWeekly()}>GENERAR REPORTE SEMANAL</button></div>
+        <SummaryCards summary={data.summary} />
+        {reviewCount > 0 && <div className="commercial-notice"><strong>{reviewCount} {reviewCount === 1 ? "documento necesita" : "documentos necesitan"} revisión.</strong> Los totales solo incluyen datos verificables. <button onClick={() => window.dispatchEvent(new CustomEvent("inventario:navigate", { detail: "invoices" }))}>Revisar excepciones</button></div>}
+        <div className="commercial-grid"><BarChart title="Pedido vs facturado por cadena" items={data.chains.map(c => ({ label: c.chain, value: c.ordered, secondary: c.invoiced }))}/><BarChart title="Dinero pendiente por cadena" items={data.chains.map(c => ({ label: `${c.chain}${c.currency ? ` · ${c.currency}` : " · moneda pendiente"}`, value: c.unbilled_amount }))}/><BarChart title="Cumplimiento por cadena · %" items={data.chains.map(c => ({ label: c.chain, value: c.fulfillment }))}/><BarChart title="Unidades faltantes por cadena" items={data.chains.map(c => ({ label: c.chain, value: c.missing }))}/></div>
+        <div className="commercial-grid">{Object.entries(data.rankings).map(([key, rows]) => <article className="commercial-panel" key={key}><h2>{{ chains_billed: "Cadenas con mayor facturación", chains_low_fulfillment: "Menor cumplimiento", chains_missing: "Mayor faltante por cadena", products_ordered: "Productos más pedidos", products_billed: "Productos más facturados", products_missing: "Productos con mayor faltante", products_impact: "Impacto económico por producto" }[key] ?? key}</h2>{rows.length ? <ol className="commercial-ranking">{rows.map((r, i) => <li key={i}><span>{r.chain || r.product_name}</span><strong>{key.includes("impact") ? money(r.unbilled_amount, r.currency) : key === "chains_billed" ? money(r.invoiced_amount, r.invoiced_currency) : key.includes("fulfillment") ? `${n(r.fulfillment)}%` : key.includes("ordered") ? n(r.ordered) : key === "products_billed" ? n(r.invoiced) : n(r.missing)}</strong></li>)}</ol> : <Empty />}</article>)}</div>
         <Alerts alerts={data.alerts} onOpen={openAlert}/>
       </>}
       {tab === "OC vs facturas" && <><div className="commercial-section-heading"><h2>Pedido, facturación y faltantes</h2><ExportLink filters={filters} view="detail"/></div><ComparisonTable key={params(filters)} rows={data.rows} onEvidence={setSelected}/></>}
@@ -80,15 +102,24 @@ export function CommercialCenter({ initialTab = "Resumen" }: { initialTab?: Tab 
       {tab === "Histórico" && <History key={params(filters)} filters={filters} data={data}/>}
       {tab === "Maestro" && <Master products={products} onSaved={refresh}/>}
       {tab === "Asistente" && <Assistant key={params(filters)} filters={filters} onEvidence={setSelected} records={data.records}/>}
-      {tab === "Reporte" && <section className="commercial-panel"><h2>Resumen para gerencia</h2>{data.executive_report.map((text, i) => <p key={i}>{text}</p>)}<div className="commercial-actions"><ExportLink filters={filters} view="general"/><ExportLink filters={filters} view="missing"/><ExportLink filters={filters} view="report" format="pdf"/></div></section>}
+      {tab === "Reporte" && <section className="commercial-panel"><div className="commercial-section-heading"><div><h2>Reporte semanal</h2><p>Usa el período aplicado. Sin fechas, utiliza la semana actual de Ecuador.</p></div><button className="commercial-primary" disabled={reportLoading} onClick={() => void generateWeekly()}>{reportLoading ? "Generando…" : "GENERAR REPORTE SEMANAL"}</button></div>{reportLoading && <p role="status">Generando el reporte con el comparativo guardado…</p>}{reportError && <p role="alert" className="commercial-error">{reportError}</p>}{weekly ? <WeeklySummary report={weekly} onOpen={openAlert} /> : !reportLoading && <p>Genera el reporte para ver el resumen general, los resultados por cadena, productos críticos y alertas.</p>}<div className="commercial-actions"><ExportLink filters={weekly ? { ...filters, date_from: weekly.period.date_from ?? "", date_to: weekly.period.date_to ?? "" } : filters} view="general"/><ExportLink filters={weekly ? { ...filters, date_from: weekly.period.date_from ?? "", date_to: weekly.period.date_to ?? "" } : filters} view="missing"/><ExportLink filters={weekly ? { ...filters, date_from: weekly.period.date_from ?? "", date_to: weekly.period.date_to ?? "" } : filters} view="report" format="pdf"/></div></section>}
       <footer className="commercial-basis"><strong>Base de cálculo.</strong> {data.basis}</footer>
     </>}
     {selected && <EvidenceDialog record={selected} products={products} onClose={() => setSelected(null)} onSaved={async () => { setSelected(null); await refresh(); }}/>}
+    {currentReview && <DocumentDialog key={currentReview.id} document={currentReview} products={products} onClose={() => setReviewDocument(null)} onSaved={refresh} />}
   </section>;
 }
 function Empty({ text = "No hay datos confirmados para estos filtros." }: {
     text?: string;
 }) { return <p className="commercial-empty">{text}</p>; }
+function SummaryCards({ summary }: { summary: Totals }) {
+    const quantity = (value: number | null) => value == null ? "Pendiente" : n(value);
+    const cards: {label: string; value: string; known?: number}[] = [{label: "Pedido total", value: quantity(summary.ordered), known: summary.ordered == null ? summary.known_ordered : undefined}, {label: "Facturado total", value: quantity(summary.invoiced), known: summary.invoiced == null ? summary.known_invoiced : undefined}, {label: "Cumplimiento", value: summary.fulfillment == null ? "Pendiente" : `${n(summary.fulfillment)} %`}, {label: "Unidades faltantes", value: quantity(summary.missing), known: summary.missing == null ? summary.known_missing : undefined}, {label: "Valor pedido", value: money(summary.ordered_amount, summary.currency)}, {label: "Valor facturado", value: money(summary.invoiced_amount, summary.invoiced_currency)}, {label: "Dinero no facturado", value: money(summary.unbilled_amount, summary.currency)}];
+    return <div className="commercial-kpis">{cards.map(({label, value, known}) => <article key={label}><span>{label}</span><strong>{value}</strong>{known != null && <small>Confirmado hasta ahora: {n(known)} unidades</small>}</article>)}</div>;
+}
+function WeeklySummary({ report, onOpen }: { report: WeeklyReport; onOpen: (alert: Alert) => void }) {
+    return <div className="commercial-weekly-report" aria-label="Reporte semanal generado"><p><strong>{displayDate(report.period.date_from)} → {displayDate(report.period.date_to)}</strong> · {report.counts.orders} OC · {report.counts.invoices} facturas · {report.counts.review_documents} documentos por revisar</p><h3>Resumen general</h3><SummaryCards summary={report.summary} /><h3>Por cadena</h3><div className="commercial-table-wrap"><table aria-label="Reporte semanal por cadena"><thead><tr>{["Cadena", "Pedido", "Facturado", "Diferencia", "% entrega", "Faltante $"].map(h => <th key={h}>{h}</th>)}</tr></thead><tbody>{report.chains.map(c => <tr key={c.chain}><td>{c.chain}</td><td>{n(c.ordered)}</td><td>{n(c.invoiced)}</td><td>{n(c.difference)}</td><td>{c.fulfillment == null ? "Pendiente" : `${n(c.fulfillment)} %`}</td><td>{money(c.unbilled_amount, c.currency)}</td></tr>)}</tbody></table>{!report.chains.length && <Empty />}</div><h3>Productos críticos</h3><div className="commercial-grid">{([['missing', 'Principales productos faltantes'], ['not_invoiced', 'Productos no facturados'], ['economic', 'Mayor dinero no facturado']] as const).map(([key, label]) => <article className="commercial-panel" key={key}><h3>{label}</h3>{report.critical_products[key].length ? <ol className="commercial-ranking">{report.critical_products[key].map((r, i) => <li key={`${r.chain}-${r.product_name}-${i}`}><span>{r.product_name}<small>{r.chain}{r.order_number && ` · OC ${r.order_number}`}</small></span><strong>{key === "economic" ? money(r.unbilled_amount, r.currency) : `${n(r.missing)} unidades`}</strong></li>)}</ol> : <Empty text="Sin productos críticos en este grupo." />}</article>)}</div><Alerts alerts={report.alerts} onOpen={onOpen} /><p className="commercial-basis">{report.basis || report.period.basis} Los importes pendientes se conservan como pendientes; los excesos no compensan faltantes de otros productos.</p></div>;
+}
 function Status({ value }: {
     value: string;
 }) { return <span className={`commercial-status ${value === "COMPLETO" || value === "VALIDADO" ? "ok" : "review"}`}>{value}</span>; }
@@ -107,7 +138,7 @@ function BarChart({ title, items }: {
     items: {
         label: string;
         value: number | null;
-        secondary?: number;
+        secondary?: number | null;
     }[];
 }) {
     const max = Math.max(1, ...items.flatMap(i => [i.value ?? 0, i.secondary ?? 0]));
@@ -120,7 +151,7 @@ function Alerts({ alerts, onOpen }: {
 function ComparisonTable({ rows, onEvidence }: {
     rows: ComparisonRow[];
     onEvidence: (e: Evidence) => void;
-}) { const [page, setPage] = useState(0); return <><div className="commercial-table-wrap"><table><thead><tr>{["Cadena / OC", "Producto", "Pedido", "Facturado", "Diferencia", "% entrega", "Faltante", "$ pedido", "$ facturado", "$ no facturado", "Estado", "Trazabilidad"].map(h => <th key={h}>{h}</th>)}</tr></thead><tbody>{rows.slice(page * 50, page * 50 + 50).map((r, i) => <tr key={i}><td>{r.chain}<small>{r.order_number}</small></td><td>{r.product_name}<small>{r.sku}</small></td><td>{n(r.ordered)}</td><td>{n(r.invoiced)}</td><td>{n(r.difference)}</td><td>{n(r.fulfillment)}{r.fulfillment != null && "%"}</td><td>{n(r.missing)}</td><td>{usd(r.ordered_amount)}</td><td>{usd(r.invoiced_amount)}</td><td>{usd(r.unbilled_amount)}</td><td><Status value={r.status}/></td><td>{r.order_records && <details><summary>OC → facturas</summary>{[...r.order_records, ...r.invoices, ...r.pending_records].map(e => <button className="commercial-evidence-link" key={e.id} onClick={() => onEvidence(e)}>{e.kind === "order" ? `OC ${e.order_number}` : `Factura ${e.invoice_number}`} · {n(e.units)} unidades</button>)}</details>}</td></tr>)}</tbody></table></div>{!rows.length && <Empty />}<Pagination page={page} total={rows.length} onChange={setPage}/></>; }
+}) { const [page, setPage] = useState(0); return <><div className="commercial-table-wrap"><table><thead><tr>{["Cadena / OC", "Producto", "Pedido", "Facturado", "Diferencia", "% entrega", "Faltante", "$ pedido", "$ facturado", "$ no facturado", "Estado", "Trazabilidad"].map(h => <th key={h}>{h}</th>)}</tr></thead><tbody>{rows.slice(page * 50, page * 50 + 50).map((r, i) => <tr key={i}><td>{r.chain}<small>{r.order_number}</small></td><td>{r.product_name}<small>{r.sku}</small></td><td>{n(r.ordered)}</td><td>{n(r.invoiced)}</td><td>{n(r.difference)}</td><td>{n(r.fulfillment)}{r.fulfillment != null && "%"}</td><td>{n(r.missing)}</td><td>{money(r.ordered_amount, r.currency)}</td><td>{money(r.invoiced_amount, r.invoiced_currency)}</td><td>{money(r.unbilled_amount, r.currency)}</td><td><Status value={r.status}/></td><td>{r.order_records && <details><summary>OC → facturas</summary>{[...r.order_records, ...r.invoices, ...r.pending_records].map(e => <button className="commercial-evidence-link" key={e.id} onClick={() => onEvidence(e)}>{e.kind === "order" ? `OC ${e.order_number}` : `Factura ${e.invoice_number}`} · {n(e.units)} unidades</button>)}</details>}</td></tr>)}</tbody></table></div>{!rows.length && <Empty />}<Pagination page={page} total={rows.length} onChange={setPage}/></>; }
 function EvidenceDialog({ record, products, onClose, onSaved }: {
     record: Evidence;
     products: CommercialProduct[];

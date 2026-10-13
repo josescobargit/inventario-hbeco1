@@ -12,7 +12,14 @@ def test_tia_profile_contains_confirmed_homologation_without_global_aliases() ->
         ("168929000", "AR003"),
         ("168933000", "AR001"),
     }
-    assert aliases_for_chain("TUTI") == []
+    assert {alias["detected_code"] for alias in aliases_for_chain("TUTI")} == {
+        "40004233",
+        "40004234",
+        "40004238",
+    }
+    assert not {alias["detected_code"] for alias in aliases} & {
+        alias["detected_code"] for alias in aliases_for_chain("TUTI")
+    }
     assert aliases_for_chain("Corporación Favorita") == []
 
 

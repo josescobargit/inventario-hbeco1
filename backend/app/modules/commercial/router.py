@@ -35,8 +35,6 @@ from app.modules.commercial.normalization import HEADERS, KIND_MAP, identity
 from app.modules.commercial.service import (
     analyze,
     catalog_context,
-    executive_report,
-    records,
 )
 
 from app.modules.commercial.processing import (
@@ -72,10 +70,90 @@ class Filters(BaseModel):
         }
 
 
-def projection(db, filters):
-    result = analyze(records(db), **filters.parameters())
-    result["executive_report"] = executive_report(result)
+def project_records(source, parameters):
+    """Use the saved-document comparison for every commercial result surface."""
+    from app.modules.commercial.analytics import build_commercial_summary
+    from app.modules.commercial.workflow import build_workflow
+
+    legacy = analyze(source, **parameters)
+    workflow_filters = {
+        key: parameters.get(key)
+        for key in ("start", "end", "chain", "product_id", "line")
+    }
+    result = build_commercial_summary(
+        build_workflow(source, **workflow_filters), **parameters
+    )
+    for key in ("sales", "sales_movements", "sales_by_line", "sell_comparison"):
+        result[key] = legacy[key]
+    for key in ("sell_in_units", "sell_out_units"):
+        result["summary"][key] = legacy["summary"][key]
+    result["evolution"] = [
+        *result.get("evolution", []),
+        *(r for r in legacy["evolution"] if r["kind"] in {"sell_in", "sell_out"}),
+    ]
+    result["records"] = list(
+        {
+            r["id"]: r
+            for r in [
+                *result["records"],
+                *(r for r in legacy["records"] if r["kind"] in {"sell_in", "sell_out"}),
+            ]
+        }.values()
+    )
+    result["alerts"].extend(
+        a for a in legacy["alerts"] if a["code"] == "sell_out_decline"
+    )
+    result["executive_report"] = report_lines(result)
     return result
+
+
+def projection(db, filters):
+    from app.modules.commercial.workflow import saved_evidence
+
+    return project_records(saved_evidence(db), filters.parameters())
+
+
+def report_lines(data):
+    summary = data["summary"]
+
+    def quantity(value):
+        return f"{value:g}" if value is not None else "pendiente de revisión"
+
+    def amount(value, currency):
+        if value is None:
+            return "sin dato completo"
+        return f"{currency or 'moneda pendiente'} {value:,.2f}"
+
+    currency = summary.get("currency")
+    unit = summary.get("quantity_unit") or "cantidades"
+    lines = [
+        f"Se pidieron {quantity(summary['ordered'])} {unit} y se facturaron {quantity(summary['invoiced'])} {unit} vinculadas a esas OC.",
+        f"Cumplimiento: {str(summary['fulfillment']) + '%' if summary['fulfillment'] is not None else 'pendiente de revisión'} (excesos limitados por producto).",
+        f"Pedido: {amount(summary['ordered_amount'], currency)}. Facturado: {amount(summary['invoiced_amount'], summary.get('invoiced_currency'))}.",
+        f"Quedaron {quantity(summary['missing'])} {unit} pendientes, valoradas en {amount(summary['unbilled_amount'], currency)} al precio neto de la OC.",
+        "POR CADENA",
+    ]
+    for row in data["chains"]:
+        lines.append(
+            f"{row['chain']}: pedido {quantity(row['ordered'])}; facturado {quantity(row['invoiced'])}; diferencia {quantity(row['difference'])}; entrega {quantity(row['fulfillment'])}%; faltante {amount(row['unbilled_amount'], row.get('currency'))}."
+        )
+    lines.append("PRODUCTOS CRÍTICOS")
+    critical = data.get("weekly_report", {}).get("critical_products", {})
+    for label, key in (
+        ("Principales faltantes", "missing"),
+        ("Sin facturación", "not_invoiced"),
+        ("Mayor impacto económico", "economic"),
+    ):
+        lines.append(label)
+        for row in critical.get(key, []):
+            lines.append(
+                f"{row['chain']} · OC {row['order_number']} · {row['product_name']}: {quantity(row['missing'])} unidades faltantes; {amount(row['unbilled_amount'], row.get('currency'))}."
+            )
+    lines.append(
+        f"ALERTAS · {summary.get('review_documents', 0)} documentos requieren revisión."
+    )
+    lines.extend(alert["message"] for alert in data["alerts"])
+    return lines
 
 
 @router.get("/dashboard")
@@ -84,10 +162,35 @@ def dashboard(_user: CurrentUser, db: DB, filters: Annotated[Filters, Depends()]
 
 
 @router.get("/workflow")
-def workflow(_user: CurrentUser, db: DB):
+def workflow(_user: CurrentUser, db: DB, filters: Annotated[Filters, Depends()]):
     from app.modules.commercial.workflow import saved_workflow
 
-    return saved_workflow(db)
+    parameters = filters.parameters()
+    return saved_workflow(
+        db,
+        **{
+            key: parameters.get(key)
+            for key in ("start", "end", "chain", "product_id", "line")
+        },
+    )
+
+
+@router.get("/weekly-report")
+def weekly_report(_user: CurrentUser, db: DB, filters: Annotated[Filters, Depends()]):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    if filters.date_from is None and filters.date_to is None:
+        today = datetime.now(ZoneInfo("America/Guayaquil")).date()
+        filters = filters.model_copy(
+            update={
+                "date_from": today - timedelta(days=today.weekday()),
+                "date_to": today,
+            }
+        )
+    result = projection(db, filters)
+    report = result["weekly_report"]
+    return {**report, "basis": result["basis"]}
 
 
 class DocumentVersionChoice(BaseModel):
@@ -492,6 +595,8 @@ def correct_document_header(
         "invoice_number",
         "extraction_confirmed",
         "status",
+        "replaces",
+        "replaced_by",
     }
     if (
         not body.values
@@ -649,15 +754,17 @@ class CompareInput(Filters):
 
 @router.post("/compare")
 def compare(body: CompareInput, _user: CurrentUser, db: DB):
+    from app.modules.commercial.workflow import saved_evidence
+
     if body.previous_from > body.previous_to:
         raise HTTPException(422, "Período anterior inválido")
-    source = records(db)
-    current = analyze(source, **body.parameters())
+    source = saved_evidence(db)
+    current = project_records(source, body.parameters())
     parameters = body.parameters()
     parameters.update(
         start=body.previous_from.isoformat(), end=body.previous_to.isoformat()
     )
-    previous = analyze(source, **parameters)
+    previous = project_records(source, parameters)
     changes = []
     for key in (
         "ordered",
@@ -849,10 +956,12 @@ EXPORT_COLUMNS = [
     ("difference", "DIFERENCIA"),
     ("fulfillment", "% ENTREGA"),
     ("missing", "FALTANTE"),
-    ("ordered_amount", "DINERO PEDIDO USD"),
-    ("invoiced_amount", "DINERO FACTURADO USD"),
-    ("unbilled_amount", "DINERO NO FACTURADO USD"),
+    ("ordered_amount", "VALOR PEDIDO"),
+    ("invoiced_amount", "VALOR FACTURADO"),
+    ("unbilled_amount", "DINERO NO FACTURADO"),
     ("status", "ESTADO"),
+    ("currency", "MONEDA OC"),
+    ("invoiced_currency", "MONEDA FACTURA"),
 ]
 
 
@@ -925,7 +1034,11 @@ def export(
                 48, max(16, len(str(column[0].value or "")) + 3)
             )
 
-    detail_rows = [r for r in data["rows"] if view != "missing" or r["missing"] > 0]
+    detail_rows = [
+        r
+        for r in data["rows"]
+        if view != "missing" or r.get("missing") is None or r["missing"] > 0
+    ]
     sheet("OC vs factura", EXPORT_COLUMNS, detail_rows)
     sheet("Por cadena", EXPORT_COLUMNS, data["chains"])
     sheet("Cadena y producto", EXPORT_COLUMNS, data["by_chain_product"])
@@ -980,6 +1093,13 @@ def export(
         [("level", "PRIORIDAD"), ("message", "DETALLE"), ("refs", "REGISTROS")],
         [{**a, "refs": ", ".join(a["record_ids"])} for a in data["alerts"]],
     )
+    critical = data.get("weekly_report", {}).get("critical_products", {})
+    for name, key in (
+        ("Productos faltantes", "missing"),
+        ("No facturados", "not_invoiced"),
+        ("Impacto económico", "economic"),
+    ):
+        sheet(name, EXPORT_COLUMNS, critical.get(key, []))
     sheet(
         "Reporte gerencial",
         [("text", "RESUMEN EJECUTIVO")],

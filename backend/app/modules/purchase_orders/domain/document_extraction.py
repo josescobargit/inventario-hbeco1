@@ -516,6 +516,14 @@ def _extract_pdf(pdf: fitz.Document, job_id: str | None = None) -> ExtractedDocu
             )
             page = pdf[page_number]
             direct_text = page.get_text("text", sort=True).strip()
+            if (
+                not direct_text
+                and not page.get_images(full=True)
+                and not page.get_drawings()
+            ):
+                pages.append(f"[[PAGE:{page_number + 1}]]")
+                del page
+                continue
             if _meaningful_digital_text(direct_text):
                 pages.append(f"[[PAGE:{page_number + 1}]]\n{direct_text}")
                 methods.add("pdf_text")

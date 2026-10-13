@@ -226,6 +226,8 @@ def parse_file(name, content):
     )
     from app.modules.commercial.invoice_extraction import (
         invoice_header,
+        invoice_text_rows,
+        validate_invoice_amounts,
         document_currency,
     )
 
@@ -242,12 +244,34 @@ def parse_file(name, content):
         else None,
     }
     defaults["currency"] = document_currency(extracted.text)
+    if not invoice and defaults.get("chain") == "GERARDO ORTIZ":
+        # Gerardo's printed store reference is distinct from Ped. Compra and is
+        # the reference reproduced in its invoices. Keep both as evidence.
+        header_text = re.split(
+            r"(?i)\b(?:cod\.?\s*prov|descripci[oó]n)\b", extracted.text, maxsplit=1
+        )[0]
+        references = set(
+            re.findall(r"\b(?:CP|RA|MA|AM|BA|BM|CA|CG|CS|QI)\d{5,}\b", header_text)
+        )
+        if len(references) == 1:
+            defaults["secondary_reference"] = next(iter(references))
     if not defaults.get("document_total"):
         total = re.search(r"(?im)^\s*Total\s+USD\s*:\s*([\d.,]+)", extracted.text)
         if total:
             defaults["document_total"] = total.group(1)
     records = []
-    if len(logical_orders) > 1 and not invoice:
+    if invoice:
+        records = [{**defaults, **row} for row in invoice_text_rows(extracted.text)]
+        if not records and suffix == ".pdf":
+            with fitz.open(stream=content, filetype="pdf") as pdf:
+                for page_number, page in enumerate(pdf, 1):
+                    for table in page.find_tables().tables:
+                        records.extend(
+                            table_records(
+                                table.extract(), f"Página {page_number}", defaults
+                            )
+                        )
+    elif len(logical_orders) > 1:
         for order_index, order_text in enumerate(logical_orders, 1):
             order_header = recognized_header(order_text)
             order_defaults = {
@@ -274,7 +298,7 @@ def parse_file(name, content):
                         "source_text": row.get("raw"),
                     }
                 )
-    elif suffix == ".pdf" and (invoice or not header.get("confidence")):
+    elif suffix == ".pdf" and not header.get("confidence"):
         with fitz.open(stream=content, filetype="pdf") as pdf:
             for page_number, page in enumerate(pdf, 1):
                 for table in page.find_tables().tables:
@@ -283,8 +307,13 @@ def parse_file(name, content):
                             table.extract(), f"Página {page_number}", defaults
                         )
                     )
-    if not records:
+    if not records and not invoice:
         for row in extracted.table_rows:
+            if re.search(
+                r"(?i)derechos\s+reservados|developed\s+by|copyright",
+                str(row.get("description") or ""),
+            ):
+                continue
             records.append(
                 {
                     **defaults,
@@ -299,6 +328,41 @@ def parse_file(name, content):
                     "source_text": row.get("raw"),
                 }
             )
+    # Price cells with four/five decimal places are explicit document decimals,
+    # unlike an ambiguous locale-formatted spreadsheet number such as 1.000.
+    if not invoice:
+        for row in records:
+            if defaults.get("chain") == "LIRIS DEL PORTAL":
+                price = re.search(
+                    r"(?i)\bCajas?x\d+\s+(\d+[.,]\d{4})", row.get("source_text") or ""
+                )
+                if price:
+                    row["unit_price"] = float(price.group(1).replace(",", "."))
+            if defaults.get("chain") == "TIA" and row.get("code"):
+                detail_text = re.split(
+                    r"(?i)Total\s+Neto|ESTIMADO\s+PROVEEDOR", extracted.text, maxsplit=1
+                )[0]
+                prices = re.search(
+                    r"\b"
+                    + re.escape(str(row["code"]))
+                    + r"\s+(\d+[.,]\d{2,5})\s+(\d+[.,]\d{2,5})",
+                    detail_text,
+                )
+                if prices:
+                    row["unit_price"] = float(prices.group(1).replace(",", "."))
+                    row["amount"] = float(prices.group(2).replace(",", "."))
+                    row["price_unit"] = "units"
+            for key in ("unit_price", "amount"):
+                value = row.get(key)
+                if key == "amount" and isinstance(value, str):
+                    followed_by_date = re.fullmatch(
+                        r"\s*(\d+[.,]\d{4,5})\s+\d{1,2}/\d{1,2}/\d{2,4}\s*", value
+                    )
+                    if followed_by_date:
+                        value = followed_by_date.group(1)
+                        row[key] = value
+                if isinstance(value, str) and re.fullmatch(r"\d+[.,]\d{4,5}", value):
+                    row[key] = float(value.replace(",", "."))
     if not records:
         records = [
             {
@@ -307,11 +371,29 @@ def parse_file(name, content):
                 "extraction_issue": "No se detectó una tabla verificable; revisar el texto extraído y el original",
             }
         ]
+    if invoice:
+        amount_issues = validate_invoice_amounts(invoice, records)
+        if amount_issues:
+            invoice["document_issues"] = [
+                *invoice.get("document_issues", []),
+                *amount_issues,
+            ]
+            for row in records:
+                row["document_issues"] = invoice["document_issues"]
     # Keep uncertainty once at document level instead of repeating it per product.
     recognized = recognized_header(extracted.text)
-    document_issues = [] if invoice else list(recognized.get("pending_fields") or [])
-    generic_ocr_review = extracted.method != "pdf_text" and not recognized.get(
-        "confidence"
+    document_issues = (
+        list(invoice.get("document_issues") or [])
+        if invoice
+        else list(recognized.get("pending_fields") or [])
+    )
+    generic_ocr_review = extracted.method != "pdf_text" and not (
+        invoice
+        and invoice.get("chain")
+        and invoice.get("invoice_number")
+        and invoice.get("date")
+        or not invoice
+        and recognized.get("confidence")
     )
     if generic_ocr_review:
         document_issues.append("Verificar cabecera extraída por OCR")

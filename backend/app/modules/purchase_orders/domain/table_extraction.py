@@ -376,7 +376,7 @@ def _extract_known_text_layouts(
     if "TIENDAS TUTI" in normalized:
         pattern = re.compile(
             r"(?m)^\s*(\d+)\s+(\d{8})\s+(.+?)\s+ELIXIR\s+"
-            r"(\d+)\s+(\d+)\s+CJ\s+[\d.,]+\s+[\d.,]+\s*$"
+            r"(\d+)\s+(\d+)\s+CJ\s+([\d.,]+)\s+([\d.,]+)\s*$"
         )
         for match in pattern.finditer(text):
             extracted.append(
@@ -390,6 +390,8 @@ def _extract_known_text_layouts(
                     "size": None,
                     "units_per_box": int(match.group(4)),
                     "quantity": int(match.group(5)),
+                    "unit_price": match.group(6),
+                    "amount": match.group(7),
                     "original_unit_type": "boxes",
                     "bounds": _text_bounds(page, match.group(2)),
                     "source": "known_text_layout",
@@ -515,16 +517,21 @@ def extract_known_order_text_rows(
     if "CORPORACION EL ROSADO" not in normalized:
         return []
     pattern = re.compile(
-        r"(?m)^\s*(\d{2})\s+(\d{18})\s+(.+?)\s+"
+        r"(?m)^\s*(\d{2,3})\s+(\d{18})\s+(.+?)\s+"
         r"([A-Z0-9]+)\s+(\S+)\s+(\d+)\s+(\d+),00\s+([\d,]+)"
     )
     rows: list[dict[str, Any]] = []
     for match in pattern.finditer(text):
         reference = match.group(4)
         if reference.isdigit() and len(reference) == 10:
-            continuation = re.match(r"\s*\n\s*(\d{3})\b", text[match.end() :])
-            if continuation:
-                reference += continuation.group(1)
+            continuation_text = re.split(
+                r"(?m)^\s*\d{2,3}\s+\d{18}\s|TOTAL DE ITEMS",
+                text[match.end() :],
+                maxsplit=1,
+            )[0]
+            suffixes = re.findall(r"(?m)(?:^|\s)(\d{3})\s*$", continuation_text)
+            if len(suffixes) == 1:
+                reference += suffixes[0]
         rows.append(
             {
                 "page": page_number,
@@ -536,6 +543,7 @@ def extract_known_order_text_rows(
                 "size": match.group(5),
                 "units_per_box": int(match.group(6)),
                 "quantity": int(match.group(7)),
+                "unit_price": match.group(8),
                 "original_unit_type": "boxes",
                 "bounds": {"x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0},
                 "source": "known_text_layout",
