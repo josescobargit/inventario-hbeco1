@@ -1,6 +1,6 @@
 # Validación del flujo comercial en localhost
 
-Alcance: OC → factura → comparativo → Dashboard → reporte semanal. No se añadieron módulos del menú ni se publicó esta versión en producción.
+Alcance: OC → factura → comparativo → Dashboard → reporte semanal. No se añadieron módulos del menú. Las pruebas descritas se ejecutaron en localhost y bases aisladas; el código se subió posteriormente a main por solicitud del usuario.
 
 ## Un solo cálculo
 
@@ -69,3 +69,15 @@ npm run lint
 ```
 
 Las pruebas usan bases aisladas; no cargan las 211 facturas ni datos sintéticos en el inventario local o de producción.
+
+## Cierre de validación y acceso publicado
+
+- Suite general del backend: 286 pruebas aprobadas y 21 omitidas cuando no se configuran documentos externos.
+- Suite comercial con documentos reales: 338 pruebas aprobadas.
+- Interfaz: 116 pruebas aprobadas. Compilación, lint y comprobación de diferencias sin errores.
+- Código comercial y recuperación privada guardados y subidos directamente a main en `1f44d24`.
+- La API pública respondió 200 a bootstrap-status con `required: false`.
+- Supabase confirmó un único usuario `joseinv`, activo y con rol `principal`.
+- Esa comprobación no valida su contraseña ni una sesión en el navegador. La prueba con las credenciales de la captura quedó pendiente de autorización explícita tras el rechazo de la revisión automática. No se restableció la clave publicada.
+- Se añadió `backend/scripts/recover_admin_access.py`: recuperación privada, auditada, de un administrador activo existente; revoca sesiones, no publica contraseñas ni crea cuentas o cambia roles.
+- Render no lanzó un deploy automático tras el push; se inició manualmente el despliegue del código `1f44d24`.
